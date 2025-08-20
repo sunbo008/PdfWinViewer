@@ -4,6 +4,7 @@
 #include <ShlObj.h>
 #include <knownfolders.h>
 #include <shlwapi.h>
+#include <shellapi.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -20,9 +21,11 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 static FPDF_DOCUMENT g_doc = nullptr;
 static FPDF_FORMHANDLE g_form = nullptr;
+static FPDF_FORMFILLINFO g_ffi{}; // 保持整个 form 环境生命周期内有效，避免退出时解引用野指针
 static int g_page_index = 0;
 static int g_dpiX = 96, g_dpiY = 96;
 static double g_zoom = 1.0;
@@ -55,6 +58,7 @@ static void RecalcPagePixelSize(HWND hWnd);
 static void UpdateScrollBars(HWND hWnd);
 static void UpdateStatusBarInfo(HWND hWnd);
 static void LayoutStatusBarChildren(HWND hWnd);
+static LRESULT CALLBACK PageEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight);
 static void CloseDoc();
 static void InitFormEnv(HWND hWnd);
@@ -63,23 +67,59 @@ static void RenderPageToDC(HWND hWnd, HDC hdc);
 static void GetDPI(HWND hWnd);
 static void ClampScroll(HWND hWnd);
 static void FitWindowToPage(HWND hWnd);
+static void JumpToPageFromEdit(HWND hWnd);
+static void SetPageAndRefresh(HWND hWnd, int newIndex);
+static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path);
+// 前向声明：在 OpenDocumentFromPath 中会用到
+static std::string WideToUTF8(const std::wstring& w);
+static void AddRecent(const std::wstring& path);
+static void UpdateRecentMenu(HWND hWnd);
 
 static void LayoutStatusBarChildren(HWND hWnd) {
     if (!g_hStatus) return;
     SendMessageW(g_hStatus, WM_SIZE, 0, 0);
     RECT rcSB{}; GetClientRect(g_hStatus, &rcSB);
-    // 设置状态栏分区：0 左侧给“Page:”与输入框，1 预留，2 右侧文本显示
-    int parts[3];
-    parts[0] = 200;          // 左侧区宽度
-    parts[1] = 380;          // 中间区右边界
-    parts[2] = -1;           // 右侧自适应
-    SendMessageW(g_hStatus, SB_SETPARTS, (WPARAM)3, (LPARAM)parts);
-    int x = 8; int y = 2;
-    if (g_hPageLabel) SetWindowPos(g_hPageLabel, nullptr, x, y, 44, 18, SWP_NOZORDER);
-    x += 48;
-    if (g_hPageEdit) SetWindowPos(g_hPageEdit, nullptr, x, y - 1, 64, 22, SWP_NOZORDER);
-    x += 68;
-    if (g_hPageTotal) SetWindowPos(g_hPageTotal, nullptr, x, y, 100, 18, SWP_NOZORDER);
+    // DPI 缩放工具
+    auto Dpi = [&](int v){ return MulDiv(v, g_dpiX, 96); };
+    // 估算“Page:”与编辑框合适宽度（根据字体与总页数）
+    int width = rcSB.right - rcSB.left;
+    int margin = Dpi(6);
+    HDC hdc = GetDC(g_hStatus);
+    HFONT hf = (HFONT)SendMessageW(g_hStatus, WM_GETFONT, 0, 0);
+    HFONT hOld = (HFONT)SelectObject(hdc, hf);
+    SIZE szText{};
+    std::wstring labelTxt = L"Page:";
+    GetTextExtentPoint32W(hdc, labelTxt.c_str(), (int)labelTxt.size(), &szText);
+    int labelW = szText.cx + Dpi(8);
+    int total = (g_doc ? FPDF_GetPageCount(g_doc) : 9999); // 没文档时按 4 位估算
+    int digits = 1; for (int t = std::max(1,total); t; t/=10) ++digits; // 至少 1 位
+    SIZE sz888{}; GetTextExtentPoint32W(hdc, L"888888", 6, &sz888);
+    int avgCharW = std::max<int>(8, (int)(sz888.cx / 6));
+    int editW = avgCharW * (digits + 2) + Dpi(20);
+    if (editW < Dpi(80)) editW = Dpi(80);
+    if (editW > Dpi(180)) editW = Dpi(180);
+    SelectObject(hdc, hOld); ReleaseDC(g_hStatus, hdc);
+    // 设置状态栏分区：仅两段。0 输入区（Page:+Edit），1 右侧剩余区域用于“/ 总数”
+    int leftPartRight = margin + labelW + margin + editW + margin;
+    int parts[2]{ leftPartRight, -1 };
+    SendMessageW(g_hStatus, SB_SETPARTS, (WPARAM)2, (LPARAM)parts);
+    // 获取分区矩形并安放控件
+    RECT r0{}, r1{}; SendMessageW(g_hStatus, SB_GETRECT, 0, (LPARAM)&r0); SendMessageW(g_hStatus, SB_GETRECT, 1, (LPARAM)&r1);
+    int editH = (r0.bottom - r0.top) - Dpi(6);
+    if (editH < Dpi(18)) editH = Dpi(18);
+    if (g_hPageLabel) SetWindowPos(g_hPageLabel, nullptr, r0.left + margin, r0.top + 2, labelW, (r0.bottom - r0.top) - 4, SWP_NOZORDER);
+    if (g_hPageEdit) SetWindowPos(g_hPageEdit, nullptr, r0.left + margin + labelW + margin, r0.top + 2, editW, editH, SWP_NOZORDER);
+    int totalW = r1.right - r1.left - margin * 2;
+    if (totalW < 40) totalW = 40;
+    if (g_hPageTotal) SetWindowPos(g_hPageTotal, nullptr, r1.left + margin, r1.top + 2, totalW, (r1.bottom - r1.top) - 4, SWP_NOZORDER);
+    // 根据字体自动提升状态栏最小高度，避免剪裁
+    HDC hdc2 = GetDC(g_hStatus);
+    HFONT hf2 = (HFONT)SendMessageW(g_hStatus, WM_GETFONT, 0, 0);
+    HFONT old2 = (HFONT)SelectObject(hdc2, hf2);
+    TEXTMETRIC tm{}; GetTextMetricsW(hdc2, &tm);
+    SelectObject(hdc2, old2); ReleaseDC(g_hStatus, hdc2);
+    int minH = tm.tmHeight + tm.tmExternalLeading + Dpi(12);
+    SendMessageW(g_hStatus, SB_SETMINHEIGHT, 0, MAKELONG(minH, 0));
 }
 
 static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight) {
@@ -136,9 +176,50 @@ static void UpdateStatusBarInfo(HWND hWnd) {
 	if (g_hPageEdit) SetWindowTextW(g_hPageEdit, buf);
 	swprintf(buf, 64, L"/ %d", total);
 	if (g_hPageTotal) SetWindowTextW(g_hPageTotal, buf);
-    // 在状态栏第3段显示整体页码文本，控件占用第1、2段
-    wchar_t sb[96]; swprintf(sb, 96, L"Page: %d / %d", cur, total);
-    SendMessageW(g_hStatus, SB_SETTEXTW, 2, (LPARAM)sb);
+    // 移除右侧重复的大号文本
+}
+
+static void JumpToPageFromEdit(HWND hWnd) {
+	if (!g_doc) return;
+	int total = FPDF_GetPageCount(g_doc);
+	if (total <= 0) return;
+	wchar_t buf[32] = L""; GetWindowTextW(g_hPageEdit, buf, 31);
+	int v = _wtoi(buf);
+	if (v < 1 || v > total) {
+		// 还原为当前页
+		swprintf(buf, 32, L"%d", g_page_index + 1);
+		SetWindowTextW(g_hPageEdit, buf);
+		return;
+	}
+	SetPageAndRefresh(hWnd, v - 1);
+}
+
+// 子类过程：拦截 Enter、Esc
+static LRESULT CALLBACK PageEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR /*uIdSubclass*/, DWORD_PTR dwRefData) {
+    HWND mainWnd = (HWND)dwRefData;
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN) { JumpToPageFromEdit(mainWnd); return 0; }
+        if (wParam == VK_ESCAPE) { UpdateStatusBarInfo(mainWnd); return 0; }
+        // 在编辑框拥有焦点时，也支持翻页快捷键
+        if (g_doc) {
+            switch (wParam) {
+            case VK_PRIOR: // PgUp
+                SetPageAndRefresh(mainWnd, g_page_index - 1); return 0;
+            case VK_NEXT:  // PgDn
+                SetPageAndRefresh(mainWnd, g_page_index + 1); return 0;
+            case VK_HOME:
+                SetPageAndRefresh(mainWnd, 0); return 0;
+            case VK_END: {
+                int pc = FPDF_GetPageCount(g_doc); if (pc > 0) SetPageAndRefresh(mainWnd, pc - 1); return 0; }
+            }
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, PageEditSubclassProc, 0);
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
 static void SetZoom(HWND hWnd, double newZoom, POINT* anchorClient) {
@@ -286,6 +367,28 @@ static std::wstring OpenPDFDialog(HWND hWnd) {
 	return L"";
 }
 
+static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path) {
+    if (path.empty()) return false;
+    CloseDoc();
+    std::string u8 = WideToUTF8(path);
+    g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
+    if (!g_doc) return false;
+    int form_type = FPDF_GetFormType(g_doc);
+    if (form_type == FORMTYPE_XFA_FULL || form_type == FORMTYPE_XFA_FOREGROUND) {
+        FPDF_LoadXFA(g_doc);
+    }
+    InitFormEnv(hWnd);
+    RecalcPagePixelSize(hWnd);
+    UpdateScrollBars(hWnd);
+    UpdateStatusBarInfo(hWnd);
+    FitWindowToPage(hWnd);
+    InvalidateRect(hWnd, nullptr, TRUE);
+    AddRecent(path);
+    UpdateRecentMenu(hWnd);
+    if (g_hPageEdit) SetFocus(g_hPageEdit);
+    return true;
+}
+
 static std::string WideToUTF8(const std::wstring& w) {
 	if (w.empty()) return {};
 	int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -395,18 +498,30 @@ static void RecalcPagePixelSize(HWND hWnd) {
 }
 
 static void CloseDoc() {
-	if (g_form) { FPDFDOC_ExitFormFillEnvironment(g_form); g_form = nullptr; }
-	if (g_doc) { FPDF_CloseDocument(g_doc); g_doc = nullptr; }
-	g_page_index = 0; g_scrollX = g_scrollY = 0; g_zoom = 1.0; g_pagePxW = g_pagePxH = 0;
+    // 先销毁 form 环境，再关闭文档
+    if (g_form) {
+        __try { FPDFDOC_ExitFormFillEnvironment(g_form); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { /* 保护性：避免第三方库异常导致崩溃 */ }
+        g_form = nullptr;
+        ZeroMemory(&g_ffi, sizeof(g_ffi));
+    }
+    if (g_doc) {
+        FPDF_CloseDocument(g_doc);
+        g_doc = nullptr;
+    }
+    g_page_index = 0; g_scrollX = g_scrollY = 0; g_zoom = 1.0; g_pagePxW = g_pagePxH = 0;
 }
 
 static void InitFormEnv(HWND hWnd) {
-	FPDF_FORMFILLINFO ffi{}; ffi.version = 2;
-	g_form = FPDFDOC_InitFormFillEnvironment(g_doc, &ffi);
-	FPDF_SetFormFieldHighlightColor(g_form, 0, 0xFF00FF00);
-	FPDF_SetFormFieldHighlightAlpha(g_form, 100);
-	FORM_DoDocumentJSAction(g_form);
-	FORM_DoDocumentOpenAction(g_form);
+	ZeroMemory(&g_ffi, sizeof(g_ffi));
+	g_ffi.version = 2;
+	g_form = FPDFDOC_InitFormFillEnvironment(g_doc, &g_ffi);
+	if (g_form) {
+		FPDF_SetFormFieldHighlightColor(g_form, 0, 0xFF00FF00);
+		FPDF_SetFormFieldHighlightAlpha(g_form, 100);
+		FORM_DoDocumentJSAction(g_form);
+		FORM_DoDocumentOpenAction(g_form);
+	}
 }
 
 static void ClampScroll(HWND hWnd) {
@@ -478,17 +593,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		AppendMenuW(g_hNavMenu, MF_STRING, ID_NAV_GOTO, L"Go to Page...\tCtrl+G");
 		AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)g_hNavMenu, L"Navigate");
 		SetMenu(hWnd, g_hMenu);
+		// 启用拖放
+		DragAcceptFiles(hWnd, TRUE);
 		// 状态栏与页码控件
 		INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
 		InitCommonControlsEx(&icc);
 		g_hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)100, GetModuleHandleW(nullptr), nullptr);
 		// 在状态栏文本之外，放置独立的页码控件（主窗口子控件）
 		g_hPageLabel = CreateWindowW(L"STATIC", L"Page:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 44, 18, g_hStatus, nullptr, nullptr, nullptr);
-		g_hPageEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 64, 22, g_hStatus, (HMENU)(INT_PTR)ID_EDIT_PAGE, nullptr, nullptr);
-		g_hPageTotal = CreateWindowW(L"STATIC", L"/ 0", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 100, 18, g_hStatus, nullptr, nullptr, nullptr);
+		g_hPageEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 116, 26, g_hStatus, (HMENU)(INT_PTR)ID_EDIT_PAGE, nullptr, nullptr);
+		g_hPageTotal = CreateWindowW(L"STATIC", L"/ 0", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, 0, 0, 160, 22, g_hStatus, nullptr, nullptr, nullptr);
+		// 限制输入长度并拦截 Enter
+		SendMessageW(g_hPageEdit, EM_SETLIMITTEXT, 9, 0);
+		SetWindowSubclass(g_hPageEdit, PageEditSubclassProc, 0, (DWORD_PTR)hWnd);
+		// 设定最小高度，保证编辑框不被裁切
+		SendMessageW(g_hStatus, SB_SETMINHEIGHT, 0, MAKELONG(22, 0));
 		LayoutStatusBarChildren(hWnd);
 		UpdateStatusBarInfo(hWnd);
 		return 0; }
+	case WM_DROPFILES: {
+		HDROP hDrop = (HDROP)wParam;
+		wchar_t file[MAX_PATH]{};
+		if (DragQueryFileW(hDrop, 0, file, MAX_PATH)) {
+			std::wstring path = file;
+			OpenDocumentFromPath(hWnd, path);
+		}
+		DragFinish(hDrop);
+		return 0;
+	}
 	case WM_DPICHANGED: {
 		UINT newDpiX = LOWORD(wParam); UINT newDpiY = HIWORD(wParam);
 		g_dpiX = (int)newDpiX; g_dpiY = (int)newDpiY;
@@ -500,17 +632,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		UINT id = LOWORD(wParam);
 		if (id == ID_FILE_OPEN) {
 			std::wstring path = OpenPDFDialog(hWnd);
-			if (!path.empty()) {
-				CloseDoc(); std::string u8 = WideToUTF8(path); g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
-				if (g_doc) {
-					int form_type = FPDF_GetFormType(g_doc);
-					if (form_type == FORMTYPE_XFA_FULL || form_type == FORMTYPE_XFA_FOREGROUND) FPDF_LoadXFA(g_doc);
-					InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); UpdateStatusBarInfo(hWnd);
-					FitWindowToPage(hWnd);
-					InvalidateRect(hWnd, nullptr, TRUE);
-					AddRecent(path); UpdateRecentMenu(hWnd);
-				}
-			}
+			if (!path.empty()) { OpenDocumentFromPath(hWnd, path); }
 			return 0;
 		}
 		if (id == ID_NAV_PREV && g_doc) { SetPageAndRefresh(hWnd, g_page_index - 1); return 0; }
@@ -528,27 +650,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			UINT idx = id - ID_RECENT_BASE; if (idx < g_recent.size()) {
 				std::wstring path = g_recent[idx];
 				if (PathFileExistsW(path.c_str())) {
-					CloseDoc(); std::string u8 = WideToUTF8(path); g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
-					if (g_doc) { int ft = FPDF_GetFormType(g_doc); if (ft==FORMTYPE_XFA_FULL||ft==FORMTYPE_XFA_FOREGROUND) FPDF_LoadXFA(g_doc); InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); UpdateStatusBarInfo(hWnd); FitWindowToPage(hWnd); InvalidateRect(hWnd, nullptr, TRUE); AddRecent(path); UpdateRecentMenu(hWnd);} }
+					OpenDocumentFromPath(hWnd, path);
+				}
 			}
 			return 0;
 		}
-		// 页码编辑框：失焦触发跳转（避免 EN_UPDATE 的频繁回调导致重入）
-		if (id == ID_EDIT_PAGE && HIWORD(wParam) == EN_KILLFOCUS) {
-			wchar_t buf[32] = L""; GetWindowTextW(g_hPageEdit, buf, 31);
-			int v = _wtoi(buf);
-			if (v >= 1) SetPageAndRefresh(hWnd, v - 1);
-			return 0;
-		}
+		// 编辑框失焦→尝试跳页
+		if (id == ID_EDIT_PAGE && HIWORD(wParam) == EN_KILLFOCUS) { JumpToPageFromEdit(hWnd); return 0; }
 		break; }
 	case WM_KEYDOWN: {
 		if (!g_doc) break;
-		if (GetFocus() == g_hPageEdit && wParam == VK_RETURN) {
-			wchar_t buf[32] = L""; GetWindowTextW(g_hPageEdit, buf, 31);
-			int v = _wtoi(buf);
-			if (v >= 1) SetPageAndRefresh(hWnd, v - 1);
-			return 0;
-		}
 		switch (wParam) {
 		case VK_PRIOR: // PgUp
 			SetPageAndRefresh(hWnd, g_page_index - 1); return 0;
@@ -568,19 +679,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	case WM_SIZE: {
 		ClampScroll(hWnd);
 		UpdateScrollBars(hWnd);
-		if (g_hStatus) {
-			SendMessageW(g_hStatus, WM_SIZE, 0, 0);
-			RECT rcCli{}; GetClientRect(hWnd, &rcCli);
-			RECT rcSB{}; GetWindowRect(g_hStatus, &rcSB);
-			int sbH = rcSB.bottom - rcSB.top;
-			int x = 6; int y = rcCli.bottom - sbH + 3;
-			SetWindowPos(g_hPageLabel, nullptr, x, y, 44, 20, SWP_NOZORDER);
-			x += 48;
-			SetWindowPos(g_hPageEdit, nullptr, x, y-2, 56, 22, SWP_NOZORDER);
-			x += 60;
-			SetWindowPos(g_hPageTotal, nullptr, x, y, 80, 20, SWP_NOZORDER);
-			UpdateStatusBarInfo(hWnd);
-		}
+		if (g_hStatus) { SendMessageW(g_hStatus, WM_SIZE, 0, 0); LayoutStatusBarChildren(hWnd); UpdateStatusBarInfo(hWnd); }
 		InvalidateRect(hWnd, nullptr, TRUE);
 		return 0;
 	}
