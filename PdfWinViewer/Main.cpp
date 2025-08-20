@@ -5,6 +5,7 @@
 #include <knownfolders.h>
 #include <shlwapi.h>
 #include <shellapi.h>
+#include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -22,9 +23,11 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 static FPDF_DOCUMENT g_doc = nullptr;
 static FPDF_FORMHANDLE g_form = nullptr;
+static ULONG_PTR g_gdiplusToken = 0;
 static FPDF_FORMFILLINFO g_ffi{}; // 保持整个 form 环境生命周期内有效，避免退出时解引用野指针
 static int g_page_index = 0;
 static int g_dpiX = 96, g_dpiY = 96;
@@ -52,6 +55,7 @@ static const UINT ID_NAV_LAST = 2004;
 static const UINT ID_NAV_GOTO = 2005;
 static const UINT ID_EDIT_PAGE = 3001;
 static const UINT ID_UPDOWN = 3002;
+static const UINT ID_CTX_EXPORT_PNG = 4001;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -74,6 +78,11 @@ static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path);
 static std::string WideToUTF8(const std::wstring& w);
 static void AddRecent(const std::wstring& path);
 static void UpdateRecentMenu(HWND hWnd);
+static void EnsureGdiplus();
+static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
+static bool SaveBufferAsPng(const wchar_t* path, const void* buffer, int width, int height, int stride);
+static std::wstring SavePngDialog(HWND hWnd, int pageIndex);
+static bool ExportCurrentPageAsPNG(HWND hWnd);
 
 static void LayoutStatusBarChildren(HWND hWnd) {
     if (!g_hStatus) return;
@@ -268,6 +277,71 @@ static void RenderPageToDC(HWND hWnd, HDC hdc) {
 		FPDFBitmap_Destroy(bmp);
 	}
 	FPDF_ClosePage(page);
+}
+
+static void EnsureGdiplus() {
+    if (g_gdiplusToken == 0) {
+        Gdiplus::GdiplusStartupInput si{};
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &si, nullptr);
+    }
+}
+
+static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
+{
+    using namespace Gdiplus;
+    UINT num = 0, size = 0;
+    GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    std::vector<BYTE> buf(size);
+    ImageCodecInfo* pImageCodecInfo = reinterpret_cast<ImageCodecInfo*>(buf.data());
+    GetImageEncoders(num, size, pImageCodecInfo);
+    for (UINT j = 0; j < num; ++j) {
+        if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) { *pClsid = pImageCodecInfo[j].Clsid; return j; }
+    }
+    return -1;
+}
+
+static bool SaveBufferAsPng(const wchar_t* path, const void* buffer, int width, int height, int stride)
+{
+    using namespace Gdiplus;
+    EnsureGdiplus();
+    Bitmap bmp(width, height, stride, PixelFormat32bppARGB, (BYTE*)buffer);
+    CLSID clsid{}; if (GetEncoderClsid(L"image/png", &clsid) < 0) return false;
+    return bmp.Save(path, &clsid) == Ok;
+}
+
+static std::wstring SavePngDialog(HWND hWnd, int pageIndex) {
+    wchar_t file[MAX_PATH]{};
+    swprintf(file, MAX_PATH, L"page_%d.png", pageIndex + 1);
+    OPENFILENAMEW ofn{ sizeof(ofn) };
+    ofn.hwndOwner = hWnd;
+    ofn.lpstrFilter = L"PNG Image (*.png)\0*.png\0\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"png";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (GetSaveFileNameW(&ofn)) return file;
+    return L"";
+}
+
+static bool ExportCurrentPageAsPNG(HWND hWnd) {
+    if (!g_doc) return false;
+    int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+    FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
+    if (!page) return false;
+    FPDF_BITMAP bmp = FPDFBitmap_Create(g_pagePxW, g_pagePxH, 1);
+    if (!bmp) { FPDF_ClosePage(page); return false; }
+    FPDFBitmap_FillRect(bmp, 0, 0, g_pagePxW, g_pagePxH, 0xFFFFFFFF);
+    int flags = FPDF_ANNOT | FPDF_LCD_TEXT;
+    FPDF_RenderPageBitmap(bmp, page, 0, 0, g_pagePxW, g_pagePxH, 0, flags);
+    void* buf = FPDFBitmap_GetBuffer(bmp);
+    int stride = FPDFBitmap_GetStride(bmp);
+    std::wstring path = SavePngDialog(hWnd, g_page_index);
+    bool ok = false;
+    if (!path.empty()) ok = SaveBufferAsPng(path.c_str(), buf, g_pagePxW, g_pagePxH, stride);
+    FPDFBitmap_Destroy(bmp);
+    FPDF_ClosePage(page);
+    return ok;
 }
 
 static void SetPageAndRefresh(HWND hWnd, int newIndex) {
@@ -621,6 +695,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		DragFinish(hDrop);
 		return 0;
 	}
+	case WM_CONTEXTMENU: {
+		// 在客户区内弹出右键菜单
+		POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		HMENU hPopup = CreatePopupMenu();
+		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_EXPORT_PNG, L"导出当前页为 PNG...");
+		int cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
+		DestroyMenu(hPopup);
+		if (cmd == ID_CTX_EXPORT_PNG) { ExportCurrentPageAsPNG(hWnd); }
+		return 0;
+	}
 	case WM_DPICHANGED: {
 		UINT newDpiX = LOWORD(wParam); UINT newDpiY = HIWORD(wParam);
 		g_dpiX = (int)newDpiX; g_dpiY = (int)newDpiY;
@@ -710,6 +794,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		return 0;
 	}
 	case WM_DESTROY: {
+		if (g_gdiplusToken) { Gdiplus::GdiplusShutdown(g_gdiplusToken); g_gdiplusToken = 0; }
 		CloseDoc();
 		FPDF_DestroyLibrary();
 		PostQuitMessage(0);
