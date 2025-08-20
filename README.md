@@ -57,6 +57,39 @@ cmake --build build --config Debug --parallel
 - Ctrl+滚轮缩放，滚轮或滚动条滚动
 - File → Recent… 可快速打开最近文件；“Clear Recent” 清空列表
 
+## 一键复现/生成同类项目的 Prompt（可复制给 AI）
+> 请将下述 Prompt 粘贴到支持代码生成/编辑的 AI 中（如 Cursor / GitHub Copilot Chat），AI 将基于 PDFium 生成一个 Win32 查看器并实现完整的右键导出功能与页码编辑等特性。
+
+```
+你是资深 Windows/Win32 + PDFium 开发助手。请在现有仓库基础上实现并保证以下功能稳定可用：
+
+目标：基于 Win32 API（非 Qt）实现一个最小 PDF 查看器（支持 XFA/V8），并具备如下功能：
+- 高 DPI（Per‑Monitor V2）；滚动条；Ctrl+滚轮缩放；FPDF_LCD_TEXT。
+- 顶部菜单：File（Open…, Recent…/Clear Recent），Navigate（Prev/Next/First/Last/Goto…）。
+- 状态栏页码：显示 “Page:” + 可编辑输入框 + “/ 总页数”；支持回车/失焦跳页，打开文档后自动聚焦到输入框；Home/End/PgUp/PgDn 可用。
+- 打开文档：若已有文档先关闭；支持拖拽 PDF 到窗口打开；维护最近文件列表到 %LOCALAPPDATA%\PdfWinViewer\recent.txt。
+- 右键菜单：
+  - “导出当前页为 PNG…”：导出整页为 PNG（按当前窗口像素）。
+  - “保存图片…”：点击命中图片对象，未命中回退为本页最大图片；优先用 `FPDFImageObj_GetBitmap` 得到原始像素，否则 `FPDFImageObj_GetRenderedBitmap` 渲染得到像素。
+    - 无论得到哪种位图，都调用 `FPDFBitmap_GetFormat()`；若格式不是 32bpp BGRA（BGRA/BGRA_Premul 之外），将 `BGR/BGRx/Gray` 逐行转换为 32bpp BGRA 后再保存。
+    - 用 GDI+ 以 32bpp ARGB 写入 PNG/JPEG，仅弹一次“保存为”对话框；新增防重入（避免双弹窗）；JPEG 保存失败回退 PNG。
+
+实现细节与约束：
+- 坚持单一保存对话框：在确认拿到有效像素后再弹框，拿不到像素不弹。
+- 递归遍历 `FORM` 内嵌对象并应用对象矩阵，优先彩色对象；未命中回退最大图片。
+- 重要 API：`FPDF_GetPageCount/LoadPage/ClosePage`，`FPDFImageObj_GetBitmap/GetRenderedBitmap/GetImageMetadata/GetImagePixelSize`，`FPDFBitmap_*` 系列，GDI+ `Bitmap::Save`。
+- 稳定性：`CloseDoc()` 先退出 Form 环境再关文档；窗口销毁时清理；高 DPI 改变时重算尺寸与滚动条；多处加入防重入标志。
+- 代码风格：清晰可读；提前返回；错误分支先处理；避免深嵌套；必要处加简明注释。
+
+交付物：
+- `PdfWinViewer/Main.cpp` 完整实现；
+- README 中补充构建步骤、右键保存说明与以上 Prompt；
+- 默认使用 VS2022 + CMake 构建，参数 `-DPDFIUM_ROOT` 和 `-DPDFIUM_OUT` 指向现有 PDFium。
+```
+
+> 小贴士：若你的系统禁用了 WIC JPEG 编码器，工程会自动回退为 PNG 保存；请确保对目标目录有写权限（避免 UAC 保护路径）。
+
+
 ## 常见问题
 - 文本不清晰：已启用 `FPDF_LCD_TEXT`；若仍模糊，检查显示缩放与显卡驱动，或尝试将窗口放大以减少二次缩放。
 - XFA 行为异常：确认 `args.gn` 已开启 `pdf_enable_xfa = true` 且在加载后调用了 `FPDF_LoadXFA`（本工程已自动处理）。
