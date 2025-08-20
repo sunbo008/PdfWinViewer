@@ -62,6 +62,7 @@ static void SetZoom(HWND hWnd, double newZoom, POINT* anchorClient);
 static void RenderPageToDC(HWND hWnd, HDC hdc);
 static void GetDPI(HWND hWnd);
 static void ClampScroll(HWND hWnd);
+static void FitWindowToPage(HWND hWnd);
 
 static void LayoutStatusBarChildren(HWND hWnd) {
     if (!g_hStatus) return;
@@ -91,6 +92,39 @@ static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight) {
 		ch = std::max(1, ch - sbH);
 	}
 	outWidth = cw; outHeight = ch;
+}
+
+static void FitWindowToPage(HWND hWnd) {
+	if (!g_doc) return;
+	// 目标客户区（内容区）应恰好容纳页面加状态栏
+	int statusH = 0;
+	if (g_hStatus) {
+		RECT rs{}; GetWindowRect(g_hStatus, &rs);
+		statusH = rs.bottom - rs.top;
+	}
+	int desiredCW = std::max(100, g_pagePxW);
+	int desiredCH = std::max(100, g_pagePxH + statusH);
+	RECT wr{ 0, 0, desiredCW, desiredCH };
+	DWORD style = (DWORD)GetWindowLongPtrW(hWnd, GWL_STYLE);
+	DWORD exStyle = (DWORD)GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+	BOOL hasMenu = (GetMenu(hWnd) != nullptr);
+	AdjustWindowRectEx(&wr, style, hasMenu, exStyle);
+	int winW = wr.right - wr.left;
+	int winH = wr.bottom - wr.top;
+	RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+	int maxW = std::max(200, (int)(wa.right - wa.left));
+	int maxH = std::max(200, (int)(wa.bottom - wa.top));
+	winW = std::min(winW, maxW);
+	winH = std::min(winH, maxH);
+	RECT cur{}; GetWindowRect(hWnd, &cur);
+	int x = cur.left, y = cur.top;
+	if (x + winW > wa.right) x = wa.right - winW;
+	if (y + winH > wa.bottom) y = wa.bottom - winH;
+	if (x < wa.left) x = wa.left;
+	if (y < wa.top) y = wa.top;
+	SetWindowPos(hWnd, nullptr, x, y, winW, winH, SWP_NOZORDER | SWP_NOACTIVATE);
+	// 触发布局更新
+	SendMessageW(hWnd, WM_SIZE, 0, 0);
 }
 
 static void UpdateStatusBarInfo(HWND hWnd) {
@@ -471,7 +505,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				if (g_doc) {
 					int form_type = FPDF_GetFormType(g_doc);
 					if (form_type == FORMTYPE_XFA_FULL || form_type == FORMTYPE_XFA_FOREGROUND) FPDF_LoadXFA(g_doc);
-					InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); InvalidateRect(hWnd, nullptr, TRUE);
+					InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); UpdateStatusBarInfo(hWnd);
+					FitWindowToPage(hWnd);
+					InvalidateRect(hWnd, nullptr, TRUE);
 					AddRecent(path); UpdateRecentMenu(hWnd);
 				}
 			}
@@ -493,7 +529,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				std::wstring path = g_recent[idx];
 				if (PathFileExistsW(path.c_str())) {
 					CloseDoc(); std::string u8 = WideToUTF8(path); g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
-					if (g_doc) { int ft = FPDF_GetFormType(g_doc); if (ft==FORMTYPE_XFA_FULL||ft==FORMTYPE_XFA_FOREGROUND) FPDF_LoadXFA(g_doc); InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); InvalidateRect(hWnd, nullptr, TRUE); AddRecent(path); UpdateRecentMenu(hWnd);} }
+					if (g_doc) { int ft = FPDF_GetFormType(g_doc); if (ft==FORMTYPE_XFA_FULL||ft==FORMTYPE_XFA_FOREGROUND) FPDF_LoadXFA(g_doc); InitFormEnv(hWnd); RecalcPagePixelSize(hWnd); UpdateScrollBars(hWnd); UpdateStatusBarInfo(hWnd); FitWindowToPage(hWnd); InvalidateRect(hWnd, nullptr, TRUE); AddRecent(path); UpdateRecentMenu(hWnd);} }
 			}
 			return 0;
 		}
