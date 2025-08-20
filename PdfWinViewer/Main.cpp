@@ -6,6 +6,7 @@
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <gdiplus.h>
+#include <wincodec.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -13,8 +14,9 @@
 #include <filesystem>
 #include <fstream>
 #include <commctrl.h>
-#include "D:\\workspace\\pdfium_20250814\\pdfium\\public\\fpdfview.h"
-#include "D:\\workspace\\pdfium_20250814\\pdfium\\public\\fpdf_formfill.h"
+#include <fpdfview.h>
+#include <fpdf_formfill.h>
+#include <fpdf_edit.h>
 
 //#pragma comment(lib, "pdfium.lib")
 #pragma comment(lib, "user32.lib")
@@ -24,6 +26,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 static FPDF_DOCUMENT g_doc = nullptr;
 static FPDF_FORMHANDLE g_form = nullptr;
@@ -40,6 +43,8 @@ static HWND g_hPageLabel = nullptr;
 static HWND g_hPageEdit = nullptr;
 static HWND g_hPageTotal = nullptr;
 static HWND g_hUpDown = nullptr;
+static bool g_savingImageNow = false;
+static bool g_inFileDialog = false;
 
 // 鏈€杩戞枃浠?
 static std::vector<std::wstring> g_recent;
@@ -56,6 +61,7 @@ static const UINT ID_NAV_GOTO = 2005;
 static const UINT ID_EDIT_PAGE = 3001;
 static const UINT ID_UPDOWN = 3002;
 static const UINT ID_CTX_EXPORT_PNG = 4001;
+static const UINT ID_CTX_SAVE_IMAGE = 4002;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -81,8 +87,15 @@ static void UpdateRecentMenu(HWND hWnd);
 static void EnsureGdiplus();
 static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
 static bool SaveBufferAsPng(const wchar_t* path, const void* buffer, int width, int height, int stride);
+static bool SaveBufferAsJpeg(const wchar_t* path, const void* buffer, int width, int height, int stride, int quality);
 static std::wstring SavePngDialog(HWND hWnd, int pageIndex);
 static bool ExportCurrentPageAsPNG(HWND hWnd);
+static bool IsPointOverImage(HWND hWnd, POINT clientPt);
+static bool ExportImageAtPoint(HWND hWnd, POINT clientPt);
+static bool SaveBinaryToFile(const wchar_t* path, const void* data, size_t size);
+static std::wstring SaveDialogWithExt(HWND hWnd, const wchar_t* defName, const wchar_t* filter, const wchar_t* defExt);
+static void EnsureCOM();
+static bool SaveImageFromObject(HWND hWnd, FPDF_PAGE page, FPDF_PAGEOBJECT imgObj);
 
 static void LayoutStatusBarChildren(HWND hWnd) {
     if (!g_hStatus) return;
@@ -90,7 +103,7 @@ static void LayoutStatusBarChildren(HWND hWnd) {
     RECT rcSB{}; GetClientRect(g_hStatus, &rcSB);
     // DPI 缩放工具
     auto Dpi = [&](int v){ return MulDiv(v, g_dpiX, 96); };
-    // 估算“Page:”与编辑框合适宽度（根据字体与总页数）
+    // 估算"Page:"与编辑框合适宽度（根据字体与总页数）
     int width = rcSB.right - rcSB.left;
     int margin = Dpi(6);
     HDC hdc = GetDC(g_hStatus);
@@ -108,7 +121,7 @@ static void LayoutStatusBarChildren(HWND hWnd) {
     if (editW < Dpi(80)) editW = Dpi(80);
     if (editW > Dpi(180)) editW = Dpi(180);
     SelectObject(hdc, hOld); ReleaseDC(g_hStatus, hdc);
-    // 设置状态栏分区：仅两段。0 输入区（Page:+Edit），1 右侧剩余区域用于“/ 总数”
+    // 设置状态栏分区：仅两段。0 输入区（Page:+Edit），1 右侧剩余区域用于"/ 总数"
     int leftPartRight = margin + labelW + margin + editW + margin;
     int parts[2]{ leftPartRight, -1 };
     SendMessageW(g_hStatus, SB_SETPARTS, (WPARAM)2, (LPARAM)parts);
@@ -305,6 +318,7 @@ static bool SaveBufferAsPng(const wchar_t* path, const void* buffer, int width, 
 {
     using namespace Gdiplus;
     EnsureGdiplus();
+    // PDFium 缓冲是 BGRA 排列，GDI+ 的 PixelFormat32bppARGB 在内存上也是 BGRA（小端），可直接包装
     Bitmap bmp(width, height, stride, PixelFormat32bppARGB, (BYTE*)buffer);
     CLSID clsid{}; if (GetEncoderClsid(L"image/png", &clsid) < 0) return false;
     return bmp.Save(path, &clsid) == Ok;
@@ -338,10 +352,296 @@ static bool ExportCurrentPageAsPNG(HWND hWnd) {
     int stride = FPDFBitmap_GetStride(bmp);
     std::wstring path = SavePngDialog(hWnd, g_page_index);
     bool ok = false;
-    if (!path.empty()) ok = SaveBufferAsPng(path.c_str(), buf, g_pagePxW, g_pagePxH, stride);
+    if (!path.empty()) {
+		if (g_inFileDialog) { FPDFBitmap_Destroy(bmp); FPDF_ClosePage(page); return false; }
+		g_inFileDialog = true;
+		int wpage = FPDFBitmap_GetWidth(bmp);
+		int hpage = FPDFBitmap_GetHeight(bmp);
+		ok = SaveBufferAsPng(path.c_str(), buf, wpage, hpage, stride);
+		g_inFileDialog = false;
+	}
     FPDFBitmap_Destroy(bmp);
     FPDF_ClosePage(page);
     return ok;
+}
+
+// 矩阵工具（同 FS_MATRIX 语义）：
+static FS_MATRIX MatrixMultiply(const FS_MATRIX& m1, const FS_MATRIX& m2) {
+	FS_MATRIX r{};
+	r.a = (float)(m1.a * m2.a + m1.c * m2.b);
+	r.b = (float)(m1.b * m2.a + m1.d * m2.b);
+	r.c = (float)(m1.a * m2.c + m1.c * m2.d);
+	r.d = (float)(m1.b * m2.c + m1.d * m2.d);
+	r.e = (float)(m1.a * m2.e + m1.c * m2.f + m1.e);
+	r.f = (float)(m1.b * m2.e + m1.d * m2.f + m1.f);
+	return r;
+}
+static POINTF TransformPoint(const FS_MATRIX& m, float x, float y) {
+	POINTF p; p.x = (float)(m.a * x + m.c * y + m.e); p.y = (float)(m.b * x + m.d * y + m.f); return p;
+}
+struct ImageCandidate {
+	FPDF_PAGEOBJECT obj{}; float minx{}, miny{}, maxx{}, maxy{}; int bpp{}; int colorspace{}; float area{};
+};
+static void CollectImagesRecursive(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS_MATRIX& parent, std::vector<ImageCandidate>& out) {
+	FS_MATRIX local{}; local.a=1; local.d=1; // identity
+	FPDFPageObj_GetMatrix(obj, &local);
+	FS_MATRIX M = MatrixMultiply(parent, local);
+	int type = FPDFPageObj_GetType(obj);
+	if (type == FPDF_PAGEOBJ_IMAGE) {
+		float l=0,b=0,r=0,t=0; if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) return;
+		POINTF p1 = TransformPoint(M, l, b);
+		POINTF p2 = TransformPoint(M, r, b);
+		POINTF p3 = TransformPoint(M, r, t);
+		POINTF p4 = TransformPoint(M, l, t);
+		ImageCandidate c{}; c.obj = obj;
+		c.minx = std::min(std::min(p1.x, p2.x), std::min(p3.x, p4.x));
+		c.maxx = std::max(std::max(p1.x, p2.x), std::max(p3.x, p4.x));
+		c.miny = std::min(std::min(p1.y, p2.y), std::min(p3.y, p4.y));
+		c.maxy = std::max(std::max(p1.y, p2.y), std::max(p3.y, p4.y));
+		FPDF_IMAGEOBJ_METADATA md{}; if (FPDFImageObj_GetImageMetadata(obj, page, &md)) { c.bpp = (int)md.bits_per_pixel; c.colorspace = md.colorspace; }
+		c.area = std::max(0.0f, (c.maxx - c.minx)) * std::max(0.0f, (c.maxy - c.miny));
+		out.push_back(c);
+		return;
+	}
+	if (type == FPDF_PAGEOBJ_FORM) {
+		int n = FPDFFormObj_CountObjects(obj);
+		for (int i=0;i<n;++i) {
+			FPDF_PAGEOBJECT child = FPDFFormObj_GetObject(obj, (unsigned long)i);
+			if (child) CollectImagesRecursive(page, child, M, out);
+		}
+	}
+}
+static FPDF_PAGEOBJECT FindImageAtPoint(FPDF_PAGE page, double pageX, double pageY, double pageHeight) {
+	// 直接使用对象的旋转边界在页坐标命中，避免递归误差
+	int count = FPDFPage_CountObjects(page);
+	float px = (float)pageX; float py = (float)(pageHeight - pageY); // PDF 坐标 y 向上
+	const float eps = 2.0f; // 2px 容差
+	for (int i = count - 1; i >= 0; --i) { // 从上往下，优先显示在上的对象
+		FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+		if (!obj) continue;
+		if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
+		FS_QUADPOINTSF qp{}; if (!FPDFPageObj_GetRotatedBounds(obj, &qp)) continue;
+		float minx = std::min(std::min(qp.x1, qp.x2), std::min(qp.x3, qp.x4)) - eps;
+		float maxx = std::max(std::max(qp.x1, qp.x2), std::max(qp.x3, qp.x4)) + eps;
+		float miny = std::min(std::min(qp.y1, qp.y2), std::min(qp.y3, qp.y4)) - eps;
+		float maxy = std::max(std::max(qp.y1, qp.y2), std::max(qp.y3, qp.y4)) + eps;
+		if (px >= minx && px <= maxx && py >= miny && py <= maxy) return obj;
+	}
+	return nullptr;
+}
+
+static bool IsPointOverImage(HWND hWnd, POINT clientPt) {
+	if (!g_doc) return false;
+	int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+	double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
+	double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+	FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
+	if (!page) return false;
+	double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
+	FPDF_PAGEOBJECT obj = FindImageAtPoint(page, pageX, pageY, h_pt);
+	FPDF_ClosePage(page);
+	return obj != nullptr;
+}
+
+static bool ExportImageAtPoint(HWND hWnd, POINT clientPt) {
+	if (!g_doc) return false;
+	EnsureCOM();
+	int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+	double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
+	double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+	FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
+	if (!page) return false;
+	double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
+	FPDF_PAGEOBJECT hitObj = FindImageAtPoint(page, pageX, pageY, h_pt);
+	bool ok = false;
+	if (hitObj) ok = SaveImageFromObject(hWnd, page, hitObj);
+	FPDF_ClosePage(page);
+	return ok;
+}
+
+static void EnsureCOM() { static bool inited=false; if (!inited) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); inited=true; } }
+
+// 将 PDFium 位图任意格式逐行转换为 32bpp BGRA 缓冲
+static void ConvertAnyToBGRA(const void* srcBuf, int width, int height, int stride, int format,
+                             std::vector<unsigned char>& outBGRA) {
+    outBGRA.assign((size_t)width * height * 4, 0);
+    const unsigned char* srcBase = static_cast<const unsigned char*>(srcBuf);
+    for (int y = 0; y < height; ++y) {
+        const unsigned char* src = srcBase + (size_t)y * stride;
+        unsigned char* dst = outBGRA.data() + (size_t)y * (width * 4);
+        if (format == FPDFBitmap_BGRA || format == FPDFBitmap_BGRA_Premul) {
+            memcpy(dst, src, (size_t)width * 4);
+        } else if (format == FPDFBitmap_BGRx) {
+            for (int x = 0; x < width; ++x) {
+                dst[4 * x + 0] = src[4 * x + 0];
+                dst[4 * x + 1] = src[4 * x + 1];
+                dst[4 * x + 2] = src[4 * x + 2];
+                dst[4 * x + 3] = 255;
+            }
+        } else if (format == FPDFBitmap_BGR) {
+            for (int x = 0; x < width; ++x) {
+                dst[4 * x + 0] = src[3 * x + 0];
+                dst[4 * x + 1] = src[3 * x + 1];
+                dst[4 * x + 2] = src[3 * x + 2];
+                dst[4 * x + 3] = 255;
+            }
+        } else if (format == FPDFBitmap_Gray) {
+            for (int x = 0; x < width; ++x) {
+                unsigned char g = src[x];
+                dst[4 * x + 0] = g; dst[4 * x + 1] = g; dst[4 * x + 2] = g; dst[4 * x + 3] = 255;
+            }
+        } else {
+            // 未知格式：尽力复制
+            memcpy(dst, src, (size_t)width * 4);
+        }
+    }
+}
+
+static bool SaveImageFromObject(HWND hWnd, FPDF_PAGE page, FPDF_PAGEOBJECT imgObj) {
+	if (!page || !imgObj) return false;
+	EnsureCOM();
+	// 先获取可以保存的位图缓冲；若两种方式都失败，则直接返回，不弹保存框
+	void* buffer = nullptr; int width = 0, height = 0, stride = 0; bool preferJpeg = false; FPDF_BITMAP hold = nullptr;
+	int nfilters = FPDFImageObj_GetImageFilterCount(imgObj);
+	for (int k = 0; k < nfilters; ++k) { char name[32]{}; if (FPDFImageObj_GetImageFilter(imgObj, k, name, sizeof(name))>0) { if (_stricmp(name, "DCTDecode")==0) { preferJpeg = true; break; } } }
+	// 优先原始像素
+	if (!buffer) {
+		FPDF_BITMAP baseBmp = FPDFImageObj_GetBitmap(imgObj);
+		if (baseBmp) {
+			void* src = FPDFBitmap_GetBuffer(baseBmp);
+			int fmt = FPDFBitmap_GetFormat(baseBmp);
+			width = FPDFBitmap_GetWidth(baseBmp);
+			height = FPDFBitmap_GetHeight(baseBmp);
+			stride = FPDFBitmap_GetStride(baseBmp);
+			static std::vector<unsigned char> convBase; convBase.clear();
+			if (fmt == FPDFBitmap_BGRA || fmt == FPDFBitmap_BGRA_Premul) {
+				buffer = src;
+			} else {
+				ConvertAnyToBGRA(src, width, height, stride, fmt, convBase);
+				buffer = convBase.data();
+				stride = width * 4;
+			}
+			hold = baseBmp;
+		}
+	}
+	// 退回渲染（包含遮罩/矩阵）
+	if (!buffer) {
+		FPDF_BITMAP bmp = FPDFImageObj_GetRenderedBitmap(g_doc, page, imgObj);
+		if (bmp) {
+			void* src = FPDFBitmap_GetBuffer(bmp);
+			int fmt = FPDFBitmap_GetFormat(bmp);
+			width = FPDFBitmap_GetWidth(bmp);
+			height = FPDFBitmap_GetHeight(bmp);
+			stride = FPDFBitmap_GetStride(bmp);
+			static std::vector<unsigned char> convR; convR.clear();
+			if (fmt == FPDFBitmap_BGRA || fmt == FPDFBitmap_BGRA_Premul) {
+				buffer = src;
+			} else {
+				ConvertAnyToBGRA(src, width, height, stride, fmt, convR);
+				buffer = convR.data();
+				stride = width * 4;
+			}
+			hold = bmp;
+		}
+	}
+	if (!buffer || width <= 0 || height <= 0) { if (hold) FPDFBitmap_Destroy(hold); return false; }
+	// 仅在确实可以保存时弹一次保存框
+	std::wstring defName = preferJpeg ? L"image.jpg" : L"image.png";
+	std::wstring path = preferJpeg ? SaveDialogWithExt(hWnd, defName.c_str(), L"JPEG Image (*.jpg)\0*.jpg\0\0", L"jpg")
+						 : SaveDialogWithExt(hWnd, defName.c_str(), L"PNG Image (*.png)\0*.png\0\0", L"png");
+	if (path.empty()) { if (hold) FPDFBitmap_Destroy(hold); return false; }
+	if (g_inFileDialog) { if (hold) FPDFBitmap_Destroy(hold); return false; }
+	g_inFileDialog = true;
+	bool ok = preferJpeg ? SaveBufferAsJpeg(path.c_str(), buffer, width, height, stride, 90)
+						 : SaveBufferAsPng(path.c_str(), buffer, width, height, stride);
+	g_inFileDialog = false;
+	// 若保存失败并且首选为 JPEG，尝试回退为 PNG（有些系统 JPEG 编码器可能不可用）
+	if (!ok && preferJpeg) {
+		std::wstring pngPath = path;
+		size_t pos = pngPath.find_last_of(L'.');
+		if (pos != std::wstring::npos) pngPath = pngPath.substr(0, pos) + L".png";
+		g_inFileDialog = true;
+		ok = SaveBufferAsPng(pngPath.c_str(), buffer, width, height, stride);
+		g_inFileDialog = false;
+	}
+	// 反馈保存结果（临时诊断用）
+	// wchar_t msg[512]; swprintf(msg, 512, L"Save image %s\nSize: %dx%d\nPath: %s", ok?L"OK":L"FAILED", width, height, (ok? path.c_str(): L"(see fallback/unknown)"));
+	// MessageBoxW(hWnd, msg, L"SaveImageFromObject", ok? MB_ICONINFORMATION : MB_ICONERROR);
+	if (hold) FPDFBitmap_Destroy(hold);
+	return ok;
+}
+
+static bool SaveBufferAsJpeg(const wchar_t* path, const void* buffer, int width, int height, int stride, int quality)
+{
+    using namespace Gdiplus;
+    EnsureGdiplus();
+    Bitmap bmp(width, height, stride, PixelFormat32bppARGB, (BYTE*)buffer);
+    CLSID clsid{}; if (GetEncoderClsid(L"image/jpeg", &clsid) < 0) return false;
+    // 设置质量参数
+    EncoderParameters ep{}; ep.Count = 1; EncoderParameter p{}; p.Guid = EncoderQuality; p.NumberOfValues = 1; p.Type = EncoderParameterValueTypeLong; ULONG q = (ULONG)(quality <= 0 ? 75 : quality); p.Value = &q; ep.Parameter[0] = p;
+    return bmp.Save(path, &clsid, &ep) == Ok;
+}
+
+static bool SaveBinaryToFile(const wchar_t* path, const void* data, size_t size) {
+	std::ofstream out(path, std::ios::binary | std::ios::trunc);
+	if (!out.good()) return false;
+	out.write(static_cast<const char*>(data), size);
+	out.close();
+	return true;
+}
+
+static std::wstring SaveDialogWithExt(HWND hWnd, const wchar_t* defName, const wchar_t* filter, const wchar_t* defExt) {
+	wchar_t file[MAX_PATH]{}; wcsncpy_s(file, defName, _TRUNCATE);
+	OPENFILENAMEW ofn{ sizeof(ofn) }; ofn.hwndOwner = hWnd; ofn.lpstrFilter = filter; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.lpstrDefExt = defExt; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+	if (GetSaveFileNameW(&ofn)) return file; return L"";
+}
+
+static std::wstring SaveImageDialog(HWND hWnd, const wchar_t* baseName) {
+	wchar_t file[MAX_PATH]{}; wcsncpy_s(file, baseName, _TRUNCATE);
+	OPENFILENAMEW ofn{ sizeof(ofn) };
+	ofn.hwndOwner = hWnd;
+	ofn.lpstrFilter = L"PNG Image (*.png)\0*.png\0BMP Image (*.bmp)\0*.bmp\0\0";
+	ofn.lpstrFile = file;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrDefExt = L"png";
+	ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+	if (GetSaveFileNameW(&ofn)) return file; return L"";
+}
+
+static void CollectImagesFlat(FPDF_PAGE page, FPDF_PAGEOBJECT obj, std::vector<FPDF_PAGEOBJECT>& out) {
+	int type = FPDFPageObj_GetType(obj);
+	if (type == FPDF_PAGEOBJ_IMAGE) { out.push_back(obj); return; }
+	if (type == FPDF_PAGEOBJ_FORM) {
+		int n = FPDFFormObj_CountObjects(obj);
+		for (int i=0;i<n;++i) {
+			FPDF_PAGEOBJECT child = FPDFFormObj_GetObject(obj, (unsigned long)i);
+			if (child) CollectImagesFlat(page, child, out);
+		}
+	}
+}
+static bool PageHasAnyImage(FPDF_PAGE page) {
+	int count = FPDFPage_CountObjects(page);
+	for (int i=0;i<count;++i) {
+		FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+		if (!obj) continue;
+		int t = FPDFPageObj_GetType(obj);
+		if (t == FPDF_PAGEOBJ_IMAGE) return true;
+		if (t == FPDF_PAGEOBJ_FORM) {
+			std::vector<FPDF_PAGEOBJECT> tmp; CollectImagesFlat(page, obj, tmp);
+			if (!tmp.empty()) return true;
+		}
+	}
+	return false;
+}
+static FPDF_PAGEOBJECT FindLargestImage(FPDF_PAGE page) {
+	std::vector<FPDF_PAGEOBJECT> all;
+	int count = FPDFPage_CountObjects(page);
+	for (int i=0;i<count;++i) { FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i); if (obj) CollectImagesFlat(page, obj, all); }
+	FPDF_PAGEOBJECT best=nullptr; unsigned int bestPixels=0;
+	for (auto obj : all) {
+		unsigned int w=0,h=0; if (FPDFImageObj_GetImagePixelSize(obj,&w,&h)) { unsigned int p=w*h; if (p>bestPixels) { bestPixels=p; best=obj; } }
+	}
+	return best;
 }
 
 static void SetPageAndRefresh(HWND hWnd, int newIndex) {
@@ -358,7 +658,7 @@ static void SetPageAndRefresh(HWND hWnd, int newIndex) {
 	UpdateStatusBarInfo(hWnd);
 }
 
-// 绠€鏄撯€滆浆鍒伴〉鐮佲€濆璇濓紙鏃犺祫婧愶紝绾唬鐮佸垱寤猴級
+// 绠€鏄撯€滆浆鍒伴〉鐮佲€濆璇濓紙鏃犺祫婧愶紝绾唬鐮佸垱寤猴級
 struct GotoCtx { HWND parent; HWND hwnd; HWND hEdit; int maxPage; int result; bool done; };
 
 static LRESULT CALLBACK GotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -698,11 +998,42 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	case WM_CONTEXTMENU: {
 		// 在客户区内弹出右键菜单
 		POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		POINT clientPt = pt; ScreenToClient(hWnd, &clientPt);
+		bool enableSave = false;
+		if (g_doc) {
+			FPDF_PAGE pg = FPDF_LoadPage(g_doc, g_page_index);
+			if (pg) {
+				double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
+				double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+				double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
+				FPDF_PAGEOBJECT obj = FindImageAtPoint(pg, pageX, pageY, h_pt);
+				enableSave = (obj != nullptr);
+				FPDF_ClosePage(pg);
+			}
+		}
 		HMENU hPopup = CreatePopupMenu();
 		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_EXPORT_PNG, L"导出当前页为 PNG...");
+		// 仅当点击位置命中图片时可用；不再提供"回退最大图片"
+		AppendMenuW(hPopup, MF_STRING | ((g_doc && enableSave) ? 0 : MF_GRAYED), ID_CTX_SAVE_IMAGE, L"保存图片...");
 		int cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
 		DestroyMenu(hPopup);
 		if (cmd == ID_CTX_EXPORT_PNG) { ExportCurrentPageAsPNG(hWnd); }
+		else if (cmd == ID_CTX_SAVE_IMAGE) {
+			if (g_doc) {
+				if (g_savingImageNow) { return 0; }
+				g_savingImageNow = true;
+				FPDF_PAGE pg = FPDF_LoadPage(g_doc, g_page_index);
+				if (pg) {
+					double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
+					double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+					double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
+					FPDF_PAGEOBJECT obj = FindImageAtPoint(pg, pageX, pageY, h_pt);
+					if (obj) { SaveImageFromObject(hWnd, pg, obj); }
+					FPDF_ClosePage(pg);
+				}
+				g_savingImageNow = false;
+			}
+		}
 		return 0;
 	}
 	case WM_DPICHANGED: {
@@ -809,7 +1140,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 	WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = cls; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
 	RegisterClassW(&wc);
 	HWND hWnd = CreateWindowW(cls, L"PDFium Win32 Viewer", WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, nullptr, nullptr, hInst, nullptr);
-	// 鑿滃崟宸插湪 WM_CREATE 涓垱寤哄苟濉厖锛堝惈鏈€杩戞祻瑙堬級锛岃繖閲屼笉鍐嶉噸澶嶅垱寤轰互鍏嶈鐩?
+	// 鑿滃崟宸插湪 WM_CREATE 涓垱寤哄苟濉厖锛堝惈鏈€杩戞祻瑙堬級锛岃繖閲屼笉鍐嶉噸澶嶅垱寤轰互鍏嶈鐩?
 	ShowWindow(hWnd, nCmdShow);
 	UpdateWindow(hWnd);
 	MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
