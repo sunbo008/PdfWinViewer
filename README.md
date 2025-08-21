@@ -74,7 +74,6 @@ cmake --build build --config Debug --parallel
 ### msbuild 编译脚本（相对路径，可移植）
 - 配置阶段自动生成（若文件不存在才生成，不会覆盖）：
   - `PdfWinViewer/msbuild_build_project_debug_x64.cmd`
-  - `PdfWinViewer/msbuild_build_debug_x64.cmd`
 - 脚本特点：
   - 使用 `%~dp0` 相对路径定位 `build/` 目录，移动工程目录后仍可使用；
   - 调用 VS 开发者环境：`VsDevCmd.bat -arch=amd64 -host_arch=amd64`；
@@ -82,6 +81,8 @@ cmake --build build --config Debug --parallel
   - 结束后检查 `build\Debug\PdfWinViewer.exe` 是否存在并输出结果（后者还带文件日志）。
 - 与任务联动：`.vscode/tasks.json` 的 `Build PdfWinViewer Debug x64` 会调用上述脚本。
 - 重新生成脚本：删除对应 `.cmd` 后重新执行 CMake 配置即可。
+- 脚本使用：
+  -PowerShell中执行： cmd /d /s /c "D:\workspace\pdfium_20250814\PdfWinViewer\msbuild_build_project_debug_x64.cmd"
 
 ### 依赖与注意事项
 - 无需 PowerShell 7。合并器使用系统自带的 Windows PowerShell（`powershell.exe`），入口为 `PdfWinViewer/tools/merge_json.cmd`，实际调用同目录下的 `merge_json.ps1`；
