@@ -1,0 +1,52 @@
+{
+  // 由 CMake configure 阶段自动生成：不存在时才写入
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build PdfWinViewer @VSCODE_DEFAULT_CONFIG@ x64",
+      "type": "shell",
+      "command": "cmd",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "\"${workspaceFolder}\\PdfWinViewer\\msbuild_build_project_debug_x64.cmd\""
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$msCompile"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "CMake Build @VSCODE_DEFAULT_CONFIG@ x64",
+      "type": "shell",
+      "command": "cmd",
+      "args": [
+        "/d",
+        "/s",
+        "/c",
+        "taskkill /f /im PdfWinViewer.exe /t >nul 2>&1 & \"C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional\\Common7\\Tools\\VsDevCmd.bat\" -arch=amd64 -host_arch=amd64 && cmake -S ${workspaceFolder}\\PdfWinViewer -B ${workspaceFolder}\\PdfWinViewer\\build -G \"Visual Studio 17 2022\" -A x64 -DCMAKE_BUILD_TYPE=@VSCODE_DEFAULT_CONFIG@ && cmake --build ${workspaceFolder}\\PdfWinViewer\\build --config @VSCODE_DEFAULT_CONFIG@"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": ["$msCompile"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      }
+    }
+  ]
+}
+
+

@@ -1,0 +1,36 @@
+{
+  // 由 CMake configure 阶段自动生成：不存在时才写入
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug PdfWinViewer (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/@VSCODE_PROGRAM_REL@",
+      "args": [],
+      "cwd": "${workspaceFolder}/@VSCODE_CWD_REL@",
+      "stopOnEntry": false,
+      "terminal": "integrated",
+      "env": {
+        "PATH": "${env:PATH};${workspaceFolder}/pdfium/out/XFA"
+      },
+      "preLaunchTask": "Build PdfWinViewer @VSCODE_DEFAULT_CONFIG@ x64"
+    },
+    {
+      "name": "Debug PdfWinViewer (CodeLLDB + CMake)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/@VSCODE_PROGRAM_REL@",
+      "args": [],
+      "cwd": "${workspaceFolder}/@VSCODE_CWD_REL@",
+      "stopOnEntry": false,
+      "terminal": "integrated",
+      "env": {
+        "PATH": "${env:PATH};${workspaceFolder}/pdfium/out/XFA"
+      },
+      "preLaunchTask": "CMake Build @VSCODE_DEFAULT_CONFIG@ x64"
+    }
+  ]
+}
+
+

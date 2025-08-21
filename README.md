@@ -51,6 +51,43 @@ cmake --build build --config Debug --parallel
 
 > CMake 构建后会自动将 `out\XFA\*.dll` 拷贝到可执行目录；若仍有缺失，手动复制 `out\XFA` 下的所有 dll 即可。
 
+## IDE/.vscode 集成与脚本自动生成
+
+### .vscode 自动生成与增量合并（支持 Cursor / CodeLLDB）
+- 默认开启：`-DGENERATE_VSCODE=ON`。配置阶段：
+  - 若工作区根目录不存在 `.vscode/launch.json`、`.vscode/tasks.json`，则根据模板自动生成；
+  - 若已存在，则进行“增量合并”，不会覆盖你已有的配置：
+    - `launch.json` 按 `name` 去重合并；
+    - `tasks.json` 按 `label` 去重合并；
+    - 合并脚本：`PdfWinViewer/tools/merge_json.ps1`（需要 `pwsh` 可执行）。
+- 生成（或合并）后的内容特点：
+  - 调试类型使用 `"type": "lldb"`，适配 Cursor（CodeLLDB）；
+  - 预置两个调试配置：
+    - `Debug PdfWinViewer (CodeLLDB)`（走 msbuild 任务）；
+    - `Debug PdfWinViewer (CodeLLDB + CMake)`（走 CMake 任务）；
+  - 预置两个任务：
+    - `Build PdfWinViewer Debug x64`（调用 msbuild 脚本，见下节）；
+    - `CMake Build Debug x64`（使用 VS2022 生成器构建 Debug 配置）。
+- 强制重新生成方法（可选）：删除 `.vscode/launch.json` 或 `.vscode/tasks.json`，然后重新执行 CMake 配置。
+- 关闭自动生成：`-DGENERATE_VSCODE=OFF`。
+
+### msbuild 编译脚本（相对路径，可移植）
+- 配置阶段自动生成（若文件不存在才生成，不会覆盖）：
+  - `PdfWinViewer/msbuild_build_project_debug_x64.cmd`
+  - `PdfWinViewer/msbuild_build_debug_x64.cmd`
+- 脚本特点：
+  - 使用 `%~dp0` 相对路径定位 `build/` 目录，移动工程目录后仍可使用；
+  - 调用 VS 开发者环境：`VsDevCmd.bat -arch=amd64 -host_arch=amd64`；
+  - 在构建前自动结束已运行的 `PdfWinViewer.exe`，避免 `LNK1168`；
+  - 结束后检查 `build\Debug\PdfWinViewer.exe` 是否存在并输出结果（后者还带文件日志）。
+- 与任务联动：`.vscode/tasks.json` 的 `Build PdfWinViewer Debug x64` 会调用上述脚本。
+- 重新生成脚本：删除对应 `.cmd` 后重新执行 CMake 配置即可。
+
+### 依赖与注意事项
+- 无需 PowerShell 7。合并器使用系统自带的 Windows PowerShell（`powershell.exe`），入口为 `PdfWinViewer/tools/merge_json.cmd`，实际调用同目录下的 `merge_json.ps1`；
+- 如 VS 安装路径不同（Community/Enterprise），请在生成的任务或脚本中调整 `VsDevCmd.bat` 的路径；
+- 模板中的 `@CMAKE_BUILD_TYPE@` 会在配置时替换为当前配置（如 `Debug`），保持与生成/调试配置一致。
+
 ## 运行
 - 双击 `build\Debug\PdfWinViewer.exe`
 - File → Open… 选择 PDF
