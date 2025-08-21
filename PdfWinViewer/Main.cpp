@@ -19,23 +19,7 @@
 #include <fpdf_formfill.h>
 #include <fpdf_edit.h>
 
-// 某些 PDFium 版本头文件中未声明该函数，这里做前向声明以便使用
-// 运行时解析以兼容未导出符号的旧版本 pdfium
-static int GetPageIndexFromDest(FPDF_DOCUMENT document, FPDF_DEST dest) {
-    if (!document || !dest) return -1;
-    HMODULE hPdfium = GetModuleHandleW(L"pdfium.dll");
-    if (!hPdfium) {
-        hPdfium = LoadLibraryW(L"pdfium.dll");
-        if (!hPdfium) return -1;
-    }
-    typedef int (FPDF_CALLCONV *PFN_GetPageIndex)(FPDF_DOCUMENT, FPDF_DEST);
-    static PFN_GetPageIndex pfn = nullptr;
-    if (!pfn) pfn = reinterpret_cast<PFN_GetPageIndex>(GetProcAddress(hPdfium, "FPDFDest_GetPageIndex"));
-    if (!pfn) pfn = reinterpret_cast<PFN_GetPageIndex>(GetProcAddress(hPdfium, "FPDFDest_GetDestPageIndex"));
-    if (!pfn) return -1;
-    int idx = pfn(document, dest);
-    return (idx >= 0) ? idx : -1;
-}
+// 直接使用公共头中的 API：FPDFDest_GetDestPageIndex
 
 //#pragma comment(lib, "pdfium.lib")
 #pragma comment(lib, "user32.lib")
@@ -157,7 +141,7 @@ static void AddBookmarkRecursive(HWND hTree, HTREEITEM hParent, FPDF_DOCUMENT do
             if (act) dest = FPDFAction_GetDest(doc, act);
         }
         if (dest) {
-            pageIndex = GetPageIndexFromDest(doc, dest);
+            pageIndex = FPDFDest_GetDestPageIndex(doc, dest);
         }
 
         TocItemData* data = new TocItemData{ pageIndex, dest };
@@ -1305,7 +1289,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				TocItemData* data = (TocItemData*)(tv->itemNew.lParam);
 				if (data && g_doc) {
 					int idx = data->pageIndex;
-					if (idx < 0 && data->dest) idx = GetPageIndexFromDest(g_doc, data->dest);
+					if (idx < 0 && data->dest) idx = FPDFDest_GetDestPageIndex(g_doc, data->dest);
 					if (idx >= 0) SetPageAndRefresh(hWnd, idx);
 					else MessageBeep(MB_ICONWARNING);
 				}
@@ -1318,7 +1302,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 						TocItemData* data = (TocItemData*)it.lParam;
 						if (data) {
 							int idx = data->pageIndex;
-							if (idx < 0 && data->dest) idx = GetPageIndexFromDest(g_doc, data->dest);
+							if (idx < 0 && data->dest) idx = FPDFDest_GetDestPageIndex(g_doc, data->dest);
 							if (idx >= 0) SetPageAndRefresh(hWnd, idx);
 							else MessageBeep(MB_ICONWARNING);
 						}
