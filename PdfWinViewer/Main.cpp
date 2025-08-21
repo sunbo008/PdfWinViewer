@@ -45,14 +45,15 @@ static HWND g_hPageTotal = nullptr;
 static HWND g_hUpDown = nullptr;
 static bool g_savingImageNow = false;
 static bool g_inFileDialog = false;
+static std::wstring g_currentDocPath; // 当前文档完整路径，仅用于标题栏显示
 
-// 鏈€杩戞枃浠?
+
 static std::vector<std::wstring> g_recent;
 static const UINT ID_FILE_OPEN = 1001;
 static const UINT ID_RECENT_BASE = 1100; // 1100..1119
 static const UINT ID_RECENT_CLEAR = 1199;
 static const size_t kMaxRecent = 10;
-// 瀵艰埅鍛戒护
+
 static const UINT ID_NAV_PREV = 2001;
 static const UINT ID_NAV_NEXT = 2002;
 static const UINT ID_NAV_FIRST = 2003;
@@ -62,6 +63,7 @@ static const UINT ID_EDIT_PAGE = 3001;
 static const UINT ID_UPDOWN = 3002;
 static const UINT ID_CTX_EXPORT_PNG = 4001;
 static const UINT ID_CTX_SAVE_IMAGE = 4002;
+static const UINT ID_CTX_PROPERTIES = 4003;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -461,6 +463,15 @@ static bool ExportImageAtPoint(HWND hWnd, POINT clientPt) {
 
 static void EnsureCOM() { static bool inited=false; if (!inited) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); inited=true; } }
 
+static void UpdateWindowTitle(HWND hWnd) {
+	std::wstring title = L"PDFium Win32 Viewer";
+	if (!g_currentDocPath.empty()) {
+		title += L" - ";
+		title += PathFindFileNameW(g_currentDocPath.c_str());
+	}
+	SetWindowTextW(hWnd, title.c_str());
+}
+
 // 将 PDFium 位图任意格式逐行转换为 32bpp BGRA 缓冲
 static void ConvertAnyToBGRA(const void* srcBuf, int width, int height, int stride, int format,
                              std::vector<unsigned char>& outBGRA) {
@@ -658,7 +669,7 @@ static void SetPageAndRefresh(HWND hWnd, int newIndex) {
 	UpdateStatusBarInfo(hWnd);
 }
 
-// 绠€鏄撯€滆浆鍒伴〉鐮佲€濆璇濓紙鏃犺祫婧愶紝绾唬鐮佸垱寤猴級
+
 struct GotoCtx { HWND parent; HWND hwnd; HWND hEdit; int maxPage; int result; bool done; };
 
 static LRESULT CALLBACK GotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -708,7 +719,7 @@ static int PromptGotoPage(HWND owner, int maxPage) {
 	HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, wc.lpszClassName, L"Go to Page", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, x, y, w, h, owner, nullptr, wc.hInstance, &ctx);
 	if (!dlg) return -1;
 	EnableWindow(owner, FALSE);
-	// 妯℃€佸惊鐜?
+	
 	MSG msg{};
 	while (!ctx.done && GetMessageW(&msg, nullptr, 0, 0)) {
 		if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -719,7 +730,6 @@ static int PromptGotoPage(HWND owner, int maxPage) {
 }
 
 static void EnableDPIAwareness() {
-	// 浼樺厛 Per-Monitor V2锛屽叾娆＄郴缁熺骇 DPI 鎰熺煡
 	auto pSetCtx = (BOOL(WINAPI*)(HANDLE))GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
 	if (pSetCtx) {
 		pSetCtx((HANDLE)-4 /*DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2*/);
@@ -747,6 +757,7 @@ static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path) {
     std::string u8 = WideToUTF8(path);
     g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
     if (!g_doc) return false;
+    g_currentDocPath = path; // 记录当前文档路径用于标题栏
     int form_type = FPDF_GetFormType(g_doc);
     if (form_type == FORMTYPE_XFA_FULL || form_type == FORMTYPE_XFA_FOREGROUND) {
         FPDF_LoadXFA(g_doc);
@@ -759,6 +770,7 @@ static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path) {
     InvalidateRect(hWnd, nullptr, TRUE);
     AddRecent(path);
     UpdateRecentMenu(hWnd);
+    UpdateWindowTitle(hWnd);
     if (g_hPageEdit) SetFocus(g_hPageEdit);
     return true;
 }
@@ -817,7 +829,6 @@ static void SaveRecent() {
 }
 
 static void AddRecent(const std::wstring& path) {
-	// 鍘婚噸锛堜笉鍖哄垎澶у皬鍐欙級
 	auto it = std::remove_if(g_recent.begin(), g_recent.end(), [&](const std::wstring& s){ return _wcsicmp(s.c_str(), path.c_str())==0; });
 	g_recent.erase(it, g_recent.end());
 	g_recent.insert(g_recent.begin(), path);
@@ -827,7 +838,7 @@ static void AddRecent(const std::wstring& path) {
 
 static void UpdateRecentMenu(HWND hWnd) {
 	if (!g_hFileMenu) return;
-	// 鍏堝垹闄ゆ棫鐨勬渶杩戦」锛圛D_RECENT_BASE..ID_RECENT_CLEAR锛?
+	// D_RECENT_BASE..ID_RECENT_CLEAR
 	for (UINT id = ID_RECENT_BASE; id <= ID_RECENT_CLEAR; ++id) {
 		for (int i = GetMenuItemCount(g_hFileMenu)-1; i >= 0; --i) {
 			MENUITEMINFOW mii{ sizeof(mii) }; mii.fMask = MIIM_ID;
@@ -836,7 +847,7 @@ static void UpdateRecentMenu(HWND hWnd) {
 			}
 		}
 	}
-	// 鍦ㄢ€淥pen...鈥濆悗鎻掑叆鍒嗛殧涓庢渶杩戦」
+	
 	int insertPos = 0;
 	int cnt = GetMenuItemCount(g_hFileMenu);
 	for (int i = 0; i < cnt; ++i) {
@@ -884,6 +895,7 @@ static void CloseDoc() {
         g_doc = nullptr;
     }
     g_page_index = 0; g_scrollX = g_scrollY = 0; g_zoom = 1.0; g_pagePxW = g_pagePxH = 0;
+    g_currentDocPath.clear();
 }
 
 static void InitFormEnv(HWND hWnd) {
@@ -1015,6 +1027,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_EXPORT_PNG, L"导出当前页为 PNG...");
 		// 仅当点击位置命中图片时可用；不再提供"回退最大图片"
 		AppendMenuW(hPopup, MF_STRING | ((g_doc && enableSave) ? 0 : MF_GRAYED), ID_CTX_SAVE_IMAGE, L"保存图片...");
+		AppendMenuW(hPopup, MF_SEPARATOR, 0, nullptr);
+		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_PROPERTIES, L"属性...");
 		int cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
 		DestroyMenu(hPopup);
 		if (cmd == ID_CTX_EXPORT_PNG) { ExportCurrentPageAsPNG(hWnd); }
@@ -1032,6 +1046,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					FPDF_ClosePage(pg);
 				}
 				g_savingImageNow = false;
+			}
+		}
+		else if (cmd == ID_CTX_PROPERTIES) {
+			if (g_doc) {
+				int pages = FPDF_GetPageCount(g_doc);
+				std::wstring name = g_currentDocPath.empty()? L"(未命名)": PathFindFileNameW(g_currentDocPath.c_str());
+				wchar_t buf[1024];
+				swprintf(buf, 1024, L"文件: %s\n路径: %s\n页数: %d", name.c_str(), g_currentDocPath.c_str(), pages);
+				MessageBoxW(hWnd, buf, L"文档属性", MB_OK | MB_ICONINFORMATION);
 			}
 		}
 		return 0;
@@ -1140,7 +1163,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 	WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.lpszClassName = cls; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
 	RegisterClassW(&wc);
 	HWND hWnd = CreateWindowW(cls, L"PDFium Win32 Viewer", WS_OVERLAPPEDWINDOW | WS_HSCROLL | WS_VSCROLL, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, nullptr, nullptr, hInst, nullptr);
-	// 鑿滃崟宸插湪 WM_CREATE 涓垱寤哄苟濉厖锛堝惈鏈€杩戞祻瑙堬級锛岃繖閲屼笉鍐嶉噸澶嶅垱寤轰互鍏嶈鐩?
+	
 	ShowWindow(hWnd, nCmdShow);
 	UpdateWindow(hWnd);
 	MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
