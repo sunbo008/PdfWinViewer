@@ -80,6 +80,7 @@ static void UpdateScrollBars(HWND hWnd);
 static void UpdateStatusBarInfo(HWND hWnd);
 static void LayoutStatusBarChildren(HWND hWnd);
 static LRESULT CALLBACK PageEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
+static LRESULT CALLBACK TocSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight);
 static void CloseDoc();
 static void InitFormEnv(HWND hWnd);
@@ -323,6 +324,31 @@ static LRESULT CALLBACK PageEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
     case WM_NCDESTROY:
         RemoveWindowSubclass(hwnd, PageEditSubclassProc, 0);
         break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// 子类过程：书签树键盘导航转发到主窗口以控制右侧页面
+static LRESULT CALLBACK TocSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR /*uIdSubclass*/, DWORD_PTR dwRefData) {
+    HWND mainWnd = (HWND)dwRefData;
+    if (msg == WM_KEYDOWN && mainWnd && g_doc) {
+        switch (wParam) {
+        case VK_PRIOR: // PgUp
+            SendMessageW(mainWnd, WM_COMMAND, MAKEWPARAM(ID_NAV_PREV, 0), (LPARAM)mainWnd);
+            return 0;
+        case VK_NEXT:  // PgDn
+            SendMessageW(mainWnd, WM_COMMAND, MAKEWPARAM(ID_NAV_NEXT, 0), (LPARAM)mainWnd);
+            return 0;
+        case VK_HOME:
+            SendMessageW(mainWnd, WM_COMMAND, MAKEWPARAM(ID_NAV_FIRST, 0), (LPARAM)mainWnd);
+            return 0;
+        case VK_END:
+            SendMessageW(mainWnd, WM_COMMAND, MAKEWPARAM(ID_NAV_LAST, 0), (LPARAM)mainWnd);
+            return 0;
+        }
+    }
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, TocSubclassProc, 0);
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
@@ -1086,6 +1112,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		g_hToc = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
 			WS_CHILD | WS_VISIBLE | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS,
 			0, 0, 200, 100, hWnd, (HMENU)(INT_PTR)20001, GetModuleHandleW(nullptr), nullptr);
+		// 拦截书签树上的翻页快捷键，转发到主窗口
+		SetWindowSubclass(g_hToc, TocSubclassProc, 0, (DWORD_PTR)hWnd);
 		// 状态栏与页码控件
 		INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
 		InitCommonControlsEx(&icc);
