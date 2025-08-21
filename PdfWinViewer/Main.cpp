@@ -14,9 +14,28 @@
 #include <filesystem>
 #include <fstream>
 #include <commctrl.h>
+#include <fpdf_doc.h>
 #include <fpdfview.h>
 #include <fpdf_formfill.h>
 #include <fpdf_edit.h>
+
+// 某些 PDFium 版本头文件中未声明该函数，这里做前向声明以便使用
+// 运行时解析以兼容未导出符号的旧版本 pdfium
+static int GetPageIndexFromDest(FPDF_DOCUMENT document, FPDF_DEST dest) {
+    if (!document || !dest) return -1;
+    HMODULE hPdfium = GetModuleHandleW(L"pdfium.dll");
+    if (!hPdfium) {
+        hPdfium = LoadLibraryW(L"pdfium.dll");
+        if (!hPdfium) return -1;
+    }
+    typedef int (FPDF_CALLCONV *PFN_GetPageIndex)(FPDF_DOCUMENT, FPDF_DEST);
+    static PFN_GetPageIndex pfn = nullptr;
+    if (!pfn) pfn = reinterpret_cast<PFN_GetPageIndex>(GetProcAddress(hPdfium, "FPDFDest_GetPageIndex"));
+    if (!pfn) pfn = reinterpret_cast<PFN_GetPageIndex>(GetProcAddress(hPdfium, "FPDFDest_GetDestPageIndex"));
+    if (!pfn) return -1;
+    int idx = pfn(document, dest);
+    return (idx >= 0) ? idx : -1;
+}
 
 //#pragma comment(lib, "pdfium.lib")
 #pragma comment(lib, "user32.lib")
@@ -49,6 +68,9 @@ static std::wstring g_currentDocPath; // 当前文档完整路径，仅用于标
 static bool g_comInited = false;
 static bool g_dragging = false;       // 鼠标左键拖拽平移
 static POINT g_lastDragPt{};
+static HWND g_hToc = nullptr;         // 书签树
+static int g_sidebarPx = 0;           // 左侧书签面板宽度（像素）
+static int g_contentOriginX = 0;      // 内容绘制与命中测试的 X 偏移
 
 
 static std::vector<std::wstring> g_recent;
@@ -102,6 +124,65 @@ static std::wstring SaveDialogWithExt(HWND hWnd, const wchar_t* defName, const w
 static void EnsureCOM();
 static void UninitCOM();
 static bool SaveImageFromObject(HWND hWnd, FPDF_PAGE page, FPDF_PAGEOBJECT imgObj);
+// 书签面板与跳转
+static void BuildBookmarks(HWND hWnd);
+static void ClearBookmarks();
+static void LayoutSidebarAndContent(HWND hWnd);
+struct TocItemData;
+
+// TreeView item param
+struct TocItemData { int pageIndex; FPDF_DEST dest; };
+
+static void ClearBookmarks() {
+    if (!g_hToc) return;
+    // 交给 TVN_DELETEITEM 逐个释放
+    TreeView_DeleteAllItems(g_hToc);
+}
+
+static void AddBookmarkRecursive(HWND hTree, HTREEITEM hParent, FPDF_DOCUMENT doc, FPDF_BOOKMARK bm) {
+    while (bm) {
+        // 标题
+        wchar_t textW[256]{};
+        unsigned long len = FPDFBookmark_GetTitle(bm, nullptr, 0);
+        std::vector<wchar_t> wbuf; wbuf.resize((len + 1) / 2 + 1);
+        if (len > 0) FPDFBookmark_GetTitle(bm, reinterpret_cast<FPDF_WCHAR*>(wbuf.data()), len);
+        if (!wbuf.empty()) wbuf[wbuf.size()-1] = 0;
+        const wchar_t* title = wbuf.empty()? L"(书签)" : wbuf.data();
+
+        // 目标页
+        int pageIndex = -1;
+        FPDF_DEST dest = FPDFBookmark_GetDest(doc, bm);
+        if (!dest) {
+            FPDF_ACTION act = FPDFBookmark_GetAction(bm);
+            if (act) dest = FPDFAction_GetDest(doc, act);
+        }
+        if (dest) {
+            pageIndex = GetPageIndexFromDest(doc, dest);
+        }
+
+        TocItemData* data = new TocItemData{ pageIndex, dest };
+        TVINSERTSTRUCTW ins{};
+        ins.hParent = hParent; ins.hInsertAfter = TVI_LAST;
+        ins.item.mask = TVIF_TEXT | TVIF_PARAM;
+        ins.item.pszText = const_cast<wchar_t*>(title);
+        ins.item.lParam = reinterpret_cast<LPARAM>(data);
+        HTREEITEM hNode = TreeView_InsertItem(hTree, &ins);
+
+        // 子节点
+        FPDF_BOOKMARK child = FPDFBookmark_GetFirstChild(doc, bm);
+        if (child) AddBookmarkRecursive(hTree, hNode, doc, child);
+
+        bm = FPDFBookmark_GetNextSibling(doc, bm);
+    }
+}
+
+static void BuildBookmarks(HWND hWnd) {
+    if (!g_hToc) return;
+    ClearBookmarks();
+    if (!g_doc) return;
+    FPDF_BOOKMARK root = FPDFBookmark_GetFirstChild(g_doc, nullptr);
+    AddBookmarkRecursive(g_hToc, TVI_ROOT, g_doc, root);
+}
 
 static void LayoutStatusBarChildren(HWND hWnd) {
     if (!g_hStatus) return;
@@ -159,6 +240,13 @@ static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight) {
 		int sbH = rs.bottom - rs.top;
 		ch = std::max(1, ch - sbH);
 	}
+	// 预留左侧书签面板宽度
+	g_contentOriginX = 0;
+	if (g_hToc && IsWindowVisible(g_hToc)) {
+		int sidebar = (g_sidebarPx > 0) ? g_sidebarPx : MulDiv(220, g_dpiX, 96);
+		g_contentOriginX = sidebar;
+		cw = std::max(1, cw - sidebar);
+	}
 	outWidth = cw; outHeight = ch;
 }
 
@@ -171,6 +259,11 @@ static void FitWindowToPage(HWND hWnd) {
 		statusH = rs.bottom - rs.top;
 	}
 	int desiredCW = std::max(100, g_pagePxW);
+	// 预留侧边栏宽度
+	if (g_hToc && IsWindowVisible(g_hToc)) {
+		int sidebar = (g_sidebarPx > 0) ? g_sidebarPx : MulDiv(220, g_dpiX, 96);
+		desiredCW += sidebar;
+	}
 	int desiredCH = std::max(100, g_pagePxH + statusH);
 	RECT wr{ 0, 0, desiredCW, desiredCH };
 	DWORD style = (DWORD)GetWindowLongPtrW(hWnd, GWL_STYLE);
@@ -292,7 +385,7 @@ static void RenderPageToDC(HWND hWnd, HDC hdc) {
 		BITMAPINFO bmi{}; bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 		bmi.bmiHeader.biWidth = cw; bmi.bmiHeader.biHeight = -ch; bmi.bmiHeader.biPlanes = 1;
 		bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
-		StretchDIBits(hdc, 0, 0, cw, ch, 0, 0, cw, ch, buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
+		StretchDIBits(hdc, g_contentOriginX, 0, cw, ch, 0, 0, cw, ch, buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
 		FPDFBitmap_Destroy(bmp);
 	}
 	FPDF_ClosePage(page);
@@ -771,6 +864,7 @@ static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path) {
     InitFormEnv(hWnd);
     RecalcPagePixelSize(hWnd);
     UpdateScrollBars(hWnd);
+    BuildBookmarks(hWnd);
     UpdateStatusBarInfo(hWnd);
     FitWindowToPage(hWnd);
     InvalidateRect(hWnd, nullptr, TRUE);
@@ -900,6 +994,7 @@ static void CloseDoc() {
         FPDF_CloseDocument(g_doc);
         g_doc = nullptr;
     }
+    ClearBookmarks();
     g_page_index = 0; g_scrollX = g_scrollY = 0; g_zoom = 1.0; g_pagePxW = g_pagePxH = 0;
     g_currentDocPath.clear();
 }
@@ -922,6 +1017,22 @@ static void ClampScroll(HWND hWnd) {
     int maxY = std::max(0, g_pagePxH - ch);
     g_scrollX = std::min(std::max(0, g_scrollX), maxX);
     g_scrollY = std::min(std::max(0, g_scrollY), maxY);
+}
+
+static void LayoutSidebarAndContent(HWND hWnd) {
+    RECT rc{}; GetClientRect(hWnd, &rc);
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    int statusH = 0;
+    if (g_hStatus) {
+        RECT rs{}; GetWindowRect(g_hStatus, &rs);
+        statusH = rs.bottom - rs.top;
+    }
+    ch = std::max(1, ch - statusH);
+    int sidebar = (g_sidebarPx > 0) ? g_sidebarPx : MulDiv(220, g_dpiX, 96);
+    if (g_hToc) {
+        SetWindowPos(g_hToc, nullptr, 0, 0, sidebar, ch, SWP_NOZORDER | SWP_SHOWWINDOW);
+    }
 }
 
 static void UpdateScrollBars(HWND hWnd) {
@@ -987,6 +1098,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		SetMenu(hWnd, g_hMenu);
 		// 启用拖放
 		DragAcceptFiles(hWnd, TRUE);
+		// 左侧书签树
+		g_hToc = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+			WS_CHILD | WS_VISIBLE | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS,
+			0, 0, 200, 100, hWnd, (HMENU)(INT_PTR)20001, GetModuleHandleW(nullptr), nullptr);
 		// 状态栏与页码控件
 		INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
 		InitCommonControlsEx(&icc);
@@ -1001,6 +1116,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		// 设定最小高度，保证编辑框不被裁切
 		SendMessageW(g_hStatus, SB_SETMINHEIGHT, 0, MAKELONG(22, 0));
 		LayoutStatusBarChildren(hWnd);
+		LayoutSidebarAndContent(hWnd);
 		UpdateStatusBarInfo(hWnd);
 		return 0; }
 	case WM_DROPFILES: {
@@ -1079,6 +1195,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (!path.empty()) { OpenDocumentFromPath(hWnd, path); }
 			return 0;
 		}
+		// TreeView 通知处理：点击书签跳页
+		if (HIWORD(wParam) == 0 && (HWND)lParam == g_hToc) {
+			// no-op
+		}
 		if (id == ID_NAV_PREV && g_doc) { SetPageAndRefresh(hWnd, g_page_index - 1); return 0; }
 		if (id == ID_NAV_NEXT && g_doc) { SetPageAndRefresh(hWnd, g_page_index + 1); return 0; }
 		if (id == ID_NAV_FIRST && g_doc) { SetPageAndRefresh(hWnd, 0); return 0; }
@@ -1124,6 +1244,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		ClampScroll(hWnd);
 		UpdateScrollBars(hWnd);
 		if (g_hStatus) { SendMessageW(g_hStatus, WM_SIZE, 0, 0); LayoutStatusBarChildren(hWnd); UpdateStatusBarInfo(hWnd); }
+		LayoutSidebarAndContent(hWnd);
 		InvalidateRect(hWnd, nullptr, TRUE);
 		return 0;
 	}
@@ -1167,6 +1288,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			UpdateScrollBars(hWnd);
 			InvalidateRect(hWnd, nullptr, TRUE);
 			return 0;
+		}
+		break;
+	}
+	case WM_NOTIFY: {
+		LPNMHDR hdr = (LPNMHDR)lParam;
+		if (hdr && hdr->hwndFrom == g_hToc) {
+			if (hdr->code == TVN_DELETEITEMW) {
+				LPNMTREEVIEWW tv = (LPNMTREEVIEWW)lParam;
+				TocItemData* d = (TocItemData*)tv->itemOld.lParam;
+				if (d) delete d;
+				return 0;
+			}
+			if (hdr->code == TVN_SELCHANGEDW) {
+				LPNMTREEVIEWW tv = (LPNMTREEVIEWW)lParam;
+				TocItemData* data = (TocItemData*)(tv->itemNew.lParam);
+				if (data && g_doc) {
+					int idx = data->pageIndex;
+					if (idx < 0 && data->dest) idx = GetPageIndexFromDest(g_doc, data->dest);
+					if (idx >= 0) SetPageAndRefresh(hWnd, idx);
+					else MessageBeep(MB_ICONWARNING);
+				}
+				return 0;
+			}
+			if (hdr->code == NM_DBLCLK) {
+				HTREEITEM sel = TreeView_GetSelection(g_hToc);
+				if (sel && g_doc) {
+					TVITEMW it{}; it.mask = TVIF_PARAM; it.hItem = sel; if (TreeView_GetItem(g_hToc, &it)) {
+						TocItemData* data = (TocItemData*)it.lParam;
+						if (data) {
+							int idx = data->pageIndex;
+							if (idx < 0 && data->dest) idx = GetPageIndexFromDest(g_doc, data->dest);
+							if (idx >= 0) SetPageAndRefresh(hWnd, idx);
+							else MessageBeep(MB_ICONWARNING);
+						}
+					}
+				}
+				return 0;
+			}
 		}
 		break;
 	}
