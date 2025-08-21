@@ -57,6 +57,12 @@ cmake --build build --config Debug --parallel
 - Ctrl+滚轮缩放，滚轮或滚动条滚动
 - File → Recent… 可快速打开最近文件；“Clear Recent” 清空列表
 
+## 项目展示
+
+如下为应用运行截图（示例）：
+
+![项目展示](image1.png)
+
 ## 一键复现/生成同类项目的 Prompt（可复制给 AI）
 > 请将下述 Prompt 粘贴到支持代码生成/编辑的 AI 中（如 Cursor / GitHub Copilot Chat），AI 将基于 PDFium 生成一个 Win32 查看器并实现完整的右键导出功能与页码编辑等特性。
 
