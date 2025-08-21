@@ -46,6 +46,9 @@ static HWND g_hUpDown = nullptr;
 static bool g_savingImageNow = false;
 static bool g_inFileDialog = false;
 static std::wstring g_currentDocPath; // 当前文档完整路径，仅用于标题栏显示
+static bool g_comInited = false;
+static bool g_dragging = false;       // 鼠标左键拖拽平移
+static POINT g_lastDragPt{};
 
 
 static std::vector<std::wstring> g_recent;
@@ -97,6 +100,7 @@ static bool ExportImageAtPoint(HWND hWnd, POINT clientPt);
 static bool SaveBinaryToFile(const wchar_t* path, const void* data, size_t size);
 static std::wstring SaveDialogWithExt(HWND hWnd, const wchar_t* defName, const wchar_t* filter, const wchar_t* defExt);
 static void EnsureCOM();
+static void UninitCOM();
 static bool SaveImageFromObject(HWND hWnd, FPDF_PAGE page, FPDF_PAGEOBJECT imgObj);
 
 static void LayoutStatusBarChildren(HWND hWnd) {
@@ -461,7 +465,9 @@ static bool ExportImageAtPoint(HWND hWnd, POINT clientPt) {
 	return ok;
 }
 
-static void EnsureCOM() { static bool inited=false; if (!inited) { CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); inited=true; } }
+static void EnsureCOM() { if (!g_comInited) { if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) g_comInited = true; } }
+
+static void UninitCOM() { if (g_comInited) { CoUninitialize(); g_comInited = false; } }
 
 static void UpdateWindowTitle(HWND hWnd) {
 	std::wstring title = L"PDFium Win32 Viewer";
@@ -1141,6 +1147,41 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		}
 		return 0;
 	}
+	case WM_LBUTTONDOWN: {
+		SetCapture(hWnd);
+		g_dragging = true;
+		g_lastDragPt.x = GET_X_LPARAM(lParam);
+		g_lastDragPt.y = GET_Y_LPARAM(lParam);
+		return 0;
+	}
+	case WM_MOUSEMOVE: {
+		if (g_dragging) {
+			POINT pt; pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam);
+			int dx = pt.x - g_lastDragPt.x;
+			int dy = pt.y - g_lastDragPt.y;
+			g_lastDragPt = pt;
+			// 鼠标向右移动，内容应向右跟随 => 滚动条减少
+			g_scrollX = std::max(0, g_scrollX - dx);
+			g_scrollY = std::max(0, g_scrollY - dy);
+			ClampScroll(hWnd);
+			UpdateScrollBars(hWnd);
+			InvalidateRect(hWnd, nullptr, TRUE);
+			return 0;
+		}
+		break;
+	}
+	case WM_LBUTTONUP: {
+		if (g_dragging) {
+			g_dragging = false;
+			releaseCapture:
+			ReleaseCapture();
+		}
+		return 0;
+	}
+	case WM_CAPTURECHANGED: {
+		g_dragging = false;
+		return 0;
+	}
 	case WM_PAINT: {
 		PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
 		RenderPageToDC(hWnd, hdc);
@@ -1151,6 +1192,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		if (g_gdiplusToken) { Gdiplus::GdiplusShutdown(g_gdiplusToken); g_gdiplusToken = 0; }
 		CloseDoc();
 		FPDF_DestroyLibrary();
+		UninitCOM();
 		PostQuitMessage(0);
 		return 0;
 	}
