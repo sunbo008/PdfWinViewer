@@ -41,12 +41,34 @@ buildtools\win\gn.exe gen out\XFA
 ## 构建 PdfWinViewer（CMake）
 在同一命令行中执行：
 ```bat
-cd /d D:\workspace\pdfium_20250814\PdfWinViewer
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-  -DPDFIUM_ROOT=D:/workspace/pdfium_20250814/pdfium ^
-  -DPDFIUM_OUT=D:/workspace/pdfium_20250814/pdfium/out/XFA
+cd /d <PdfWinViewer项目目录路径>
+```
+
+### 情况一：PdfWinViewer 和 pdfium 是同级目录
+如果目录结构如下：
+```
+workspace/
+├── PdfWinViewer/
+└── pdfium/
+```
+直接执行：
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Debug --parallel
 ```
+
+### 情况二：PdfWinViewer 和 pdfium 不是同级目录
+如果目录结构不同，需要指定 PDFium 的路径：
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DPDFIUM_ROOT=<pdfium目录路径>
+cmake --build build --config Debug --parallel
+```
+例如：
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DPDFIUM_ROOT=D:/workspace/pdfium_20250814/pdfium
+cmake --build build --config Debug --parallel
+```
+
 可执行文件位置：`build\Debug\PdfWinViewer.exe`
 
 > CMake 构建后会自动将 `out\XFA\*.dll` 拷贝到可执行目录；若仍有缺失，手动复制 `out\XFA` 下的所有 dll 即可。

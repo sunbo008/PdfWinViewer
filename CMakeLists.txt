@@ -5,10 +5,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 可通过 -DPDFIUM_ROOT=... -DPDFIUM_OUT=... 覆盖
-set(PDFIUM_ROOT "D:/workspace/pdfium_20250814/pdfium" CACHE PATH "PDFium root")
-set(PDFIUM_OUT  "${PDFIUM_ROOT}/out/XFA" CACHE PATH "PDFium output dir containing pdfium.dll and import lib")
-set(PDFIUM_IMPORT_LIB "${PDFIUM_OUT}/pdfium.dll.lib")
+# 可通过 -DPDFIUM_ROOT=... 覆盖
+set(PDFIUM_ROOT "${CMAKE_SOURCE_DIR}/../pdfium" CACHE PATH "PDFium root")
+set(PDFIUM_BIN  "${PDFIUM_ROOT}/bin" CACHE PATH "PDFium bin dir containing pdfium.dll")
+set(PDFIUM_LIB  "${PDFIUM_ROOT}/lib" CACHE PATH "PDFium lib dir containing import lib")
+set(PDFIUM_IMPORT_LIB "${PDFIUM_LIB}/pdfium.dll.lib")
 
 add_executable(PdfWinViewer WIN32
   PdfWinViewer/Main.cpp
@@ -17,11 +18,10 @@ add_executable(PdfWinViewer WIN32
 target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX)
 
 target_include_directories(PdfWinViewer PRIVATE
-  "${PDFIUM_ROOT}/public"
-  "${PDFIUM_ROOT}"
+  "${PDFIUM_ROOT}/include"
 )
 
-target_link_directories(PdfWinViewer PRIVATE "${PDFIUM_OUT}")
+target_link_directories(PdfWinViewer PRIVATE "${PDFIUM_LIB}")
 
 target_link_libraries(PdfWinViewer PRIVATE
   "${PDFIUM_IMPORT_LIB}"
@@ -37,12 +37,12 @@ add_custom_command(TARGET PdfWinViewer POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E echo "Copying PDFium DLLs..."
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PdfWinViewer>"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${PDFIUM_OUT}/pdfium.dll
+          ${PDFIUM_BIN}/pdfium.dll
           "$<TARGET_FILE_DIR:PdfWinViewer>"
 )
 
 # 可选：拷贝同目录其他依赖 dll（采用通配处理，若失败则忽略）
-file(GLOB PDFIUM_DLLS "${PDFIUM_OUT}/*.dll")
+file(GLOB PDFIUM_DLLS "${PDFIUM_BIN}/*.dll")
 foreach(dll ${PDFIUM_DLLS})
   add_custom_command(TARGET PdfWinViewer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
