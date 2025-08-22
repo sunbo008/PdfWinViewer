@@ -42,6 +42,7 @@ static double g_zoom = 1.0;
 static int g_scrollX = 0, g_scrollY = 0;
 static int g_pagePxW = 0, g_pagePxH = 0;
 static HMENU g_hMenu = nullptr, g_hFileMenu = nullptr, g_hNavMenu = nullptr;
+static HMENU g_hSettingsMenu = nullptr;
 static HWND g_hStatus = nullptr;
 static HWND g_hPageLabel = nullptr;
 static HWND g_hPageEdit = nullptr;
@@ -75,6 +76,7 @@ static const UINT ID_CTX_EXPORT_PNG = 4001;
 static const UINT ID_CTX_SAVE_IMAGE = 4002;
 static const UINT ID_CTX_PROPERTIES = 4003;
 static const UINT ID_CTX_COPY_TEXT = 4004;
+static const UINT ID_SETTINGS_OPEN = 5001;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -239,6 +241,252 @@ static void TryNavigateLinkAtPoint(HWND hWnd, POINT clientPt) {
 		}
 	}
 	FPDF_ClosePage(page);
+}
+
+// ========== 设置持久化 ==========
+struct AiTokenPair { std::wstring agent; std::wstring token; };
+struct AppSettings { std::vector<std::wstring> kbDirs; std::vector<AiTokenPair> tokens; };
+static AppSettings g_settings;
+
+static std::filesystem::path GetSettingsFilePath() {
+	std::filesystem::path dir;
+	PWSTR p = nullptr;
+	if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &p))) {
+		dir = std::filesystem::path(p) / L"PdfWinViewer";
+		CoTaskMemFree(p);
+	} else {
+		wchar_t buf[MAX_PATH]; GetTempPathW(MAX_PATH, buf); dir = std::filesystem::path(buf) / L"PdfWinViewer";
+	}
+	std::error_code ec; std::filesystem::create_directories(dir, ec);
+	return dir / L"settings.json";
+}
+
+static std::wstring JsonEscape(const std::wstring& in) {
+	std::wstring out; out.reserve(in.size()+8);
+	for (wchar_t c : in) {
+		if (c == L'\\' || c == L'"') { out.push_back(L'\\'); out.push_back(c); }
+		else if (c == L'\n') { out += L"\\n"; }
+		else if (c == L'\r') { out += L"\\r"; }
+		else if (c == L'\t') { out += L"\\t"; }
+		else { out.push_back(c); }
+	}
+	return out;
+}
+
+static void SaveSettings() {
+	auto path = GetSettingsFilePath();
+	std::wofstream out(path, std::ios::binary | std::ios::trunc);
+	if (!out.good()) return;
+	out << L"{\n  \"kb_dirs\": [";
+	for (size_t i=0;i<g_settings.kbDirs.size();++i) {
+		if (i) out << L",";
+		out << L"\n    \"" << JsonEscape(g_settings.kbDirs[i]) << L"\"";
+	}
+	out << L"\n  ],\n  \"ai_tokens\": [";
+	for (size_t i=0;i<g_settings.tokens.size();++i) {
+		if (i) out << L",";
+		out << L"\n    {\"agent\": \"" << JsonEscape(g_settings.tokens[i].agent) << L"\", \"token\": \"" << JsonEscape(g_settings.tokens[i].token) << L"\"}";
+	}
+	out << L"\n  ]\n}\n";
+	out.close();
+}
+
+static void SkipSpaces(const std::wstring& s, size_t& i) { while (i<s.size() && iswspace(s[i])) ++i; }
+static bool MatchLit(const std::wstring& s, size_t& i, const wchar_t* lit) { size_t j=0; while (lit[j]) { if (i>=s.size() || s[i]!=lit[j]) return false; ++i; ++j; } return true; }
+static bool ReadQuoted(const std::wstring& s, size_t& i, std::wstring& out) {
+	SkipSpaces(s,i); if (i>=s.size() || s[i]!=L'"') return false; ++i; out.clear();
+	while (i<s.size()) { wchar_t c=s[i++]; if (c==L'"') return true; if (c==L'\\' && i<s.size()) { wchar_t e=s[i++]; if (e==L'"'||e==L'\\') out.push_back(e); else if (e==L'n') out.push_back(L'\n'); else if (e==L'r') out.push_back(L'\r'); else if (e==L't') out.push_back(L'\t'); else out.push_back(e);} else out.push_back(c);} return false; }
+
+static void LoadSettings() {
+	g_settings.kbDirs.clear(); g_settings.tokens.clear();
+	auto path = GetSettingsFilePath();
+	std::wifstream in(path, std::ios::binary);
+	if (!in.good()) return;
+	std::wstring s((std::istreambuf_iterator<wchar_t>(in)), std::istreambuf_iterator<wchar_t>());
+	size_t i=0; SkipSpaces(s,i);
+	// parse { "kb_dirs": [..], "ai_tokens": [..] }
+	if (i>=s.size() || s[i]!=L'{') return; ++i;
+	while (i<s.size()) {
+		SkipSpaces(s,i); if (i<s.size() && s[i]==L'}') { ++i; break; }
+		std::wstring key; if (!ReadQuoted(s,i,key)) break; SkipSpaces(s,i); if (i>=s.size()||s[i]!=L':') break; ++i; SkipSpaces(s,i);
+		if (key==L"kb_dirs") {
+			if (i<s.size() && s[i]==L'[') { ++i; SkipSpaces(s,i);
+				while (i<s.size() && s[i]!=L']') { std::wstring val; if (!ReadQuoted(s,i,val)) break; g_settings.kbDirs.push_back(val); SkipSpaces(s,i); if (i<s.size() && s[i]==L',') { ++i; SkipSpaces(s,i);} else break; }
+				if (i<s.size() && s[i]==L']') ++i;
+			}
+		} else if (key==L"ai_tokens") {
+			if (i<s.size() && s[i]==L'[') { ++i; SkipSpaces(s,i);
+				while (i<s.size() && s[i]!=L']') { SkipSpaces(s,i); if (i<s.size() && s[i]==L'{') { ++i; SkipSpaces(s,i); AiTokenPair p{}; bool done=false; while (i<s.size() && !done) { std::wstring k; if (!ReadQuoted(s,i,k)) break; SkipSpaces(s,i); if (i<s.size() && s[i]==L':') ++i; SkipSpaces(s,i); std::wstring v; ReadQuoted(s,i,v); if (k==L"agent") p.agent=v; else if (k==L"token") p.token=v; SkipSpaces(s,i); if (i<s.size() && s[i]==L',') { ++i; SkipSpaces(s,i);} else { /* maybe end */ } if (i<s.size() && s[i]==L'}') { ++i; done=true; }} g_settings.tokens.push_back(p); SkipSpaces(s,i); if (i<s.size() && s[i]==L',') { ++i; SkipSpaces(s,i);} else break; } else break; }
+				if (i<s.size() && s[i]==L']') ++i;
+			}
+		}
+		SkipSpaces(s,i); if (i<s.size() && s[i]==L',') { ++i; continue; }
+	}
+}
+
+// ========== 设置窗口 ==========
+struct SettingsCtx {
+	HWND owner{}; HWND hwnd{};
+	HWND hListKb{}; HWND hBtnAddKb{}; HWND hBtnRemKb{}; HWND hBtnUpKb{}; HWND hBtnDownKb{};
+	HWND hListTok{}; HWND hEdAgent{}; HWND hEdToken{}; HWND hBtnTokAdd{}; HWND hBtnTokRem{};
+	int dpiX{96}; int dpiY{96};
+	HFONT hFont{};
+};
+
+static void SettingsRefreshKbList(SettingsCtx* ctx) {
+	send:
+	SendMessageW(ctx->hListKb, LB_RESETCONTENT, 0, 0);
+	for (auto& d : g_settings.kbDirs) { SendMessageW(ctx->hListKb, LB_ADDSTRING, 0, (LPARAM)d.c_str()); }
+}
+
+static std::wstring MaskToken(const std::wstring& t) { if (t.size()<=4) return L"****"; return t.substr(0,3) + L"****"; }
+
+static void SettingsRefreshTokList(SettingsCtx* ctx) {
+	SendMessageW(ctx->hListTok, LB_RESETCONTENT, 0, 0);
+	for (auto& p : g_settings.tokens) {
+		std::wstring line = p.agent + L"\t" + MaskToken(p.token);
+		SendMessageW(ctx->hListTok, LB_ADDSTRING, 0, (LPARAM)line.c_str());
+	}
+}
+
+static HFONT CreateUIFontForDPI(int dpiY, int pointSize) {
+	int height = -MulDiv(pointSize, dpiY, 72);
+	return CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+		CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"宋体");
+}
+
+static void SettingsApplyFont(SettingsCtx* ctx) {
+	if (!ctx || !IsWindow(ctx->hwnd)) return;
+	if (ctx->hFont) { DeleteObject(ctx->hFont); ctx->hFont = nullptr; }
+	ctx->hFont = CreateUIFontForDPI(ctx->dpiY, 14);
+	auto setf = [&](HWND h){ if (h) SendMessageW(h, WM_SETFONT, (WPARAM)ctx->hFont, TRUE); };
+	setf(GetDlgItem(ctx->hwnd, 7001));
+	setf(ctx->hListKb); setf(ctx->hBtnAddKb); setf(ctx->hBtnRemKb); setf(ctx->hBtnUpKb); setf(ctx->hBtnDownKb);
+	setf(GetDlgItem(ctx->hwnd, 7002));
+	setf(GetDlgItem(ctx->hwnd, 7003)); setf(ctx->hEdAgent);
+	setf(GetDlgItem(ctx->hwnd, 7004)); setf(ctx->hEdToken);
+	setf(ctx->hListTok); setf(ctx->hBtnTokAdd); setf(ctx->hBtnTokRem);
+	setf(GetDlgItem(ctx->hwnd, 6199));
+}
+
+static void SettingsAddKbDir(HWND owner, SettingsCtx* ctx) {
+	EnsureCOM();
+	IFileDialog* pfd = nullptr;
+	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd));
+	if (SUCCEEDED(hr) && pfd) {
+		DWORD opt = 0; pfd->GetOptions(&opt); pfd->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+		if (SUCCEEDED(pfd->Show(owner))) {
+			IShellItem* it = nullptr; if (SUCCEEDED(pfd->GetResult(&it)) && it) {
+				PWSTR psz = nullptr; if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &psz)) && psz) {
+					std::wstring path = psz; CoTaskMemFree(psz);
+					if (!path.empty()) {
+						// 去重
+						auto itf = std::find_if(g_settings.kbDirs.begin(), g_settings.kbDirs.end(), [&](const std::wstring& s){ return _wcsicmp(s.c_str(), path.c_str())==0; });
+						if (itf == g_settings.kbDirs.end()) { g_settings.kbDirs.push_back(path); SaveSettings(); SettingsRefreshKbList(ctx); }
+					}
+				}
+				it->Release();
+			}
+		}
+		pfd->Release();
+	}
+}
+
+static void SettingsRemoveSelectedKb(SettingsCtx* ctx) {
+	int sel = (int)SendMessageW(ctx->hListKb, LB_GETCURSEL, 0, 0);
+	if (sel != LB_ERR && sel < (int)g_settings.kbDirs.size()) { g_settings.kbDirs.erase(g_settings.kbDirs.begin()+sel); SaveSettings(); SettingsRefreshKbList(ctx); if (sel >= (int)g_settings.kbDirs.size()) sel = (int)g_settings.kbDirs.size()-1; if (sel>=0) SendMessageW(ctx->hListKb, LB_SETCURSEL, sel, 0); }
+}
+
+static void SettingsMoveKb(SettingsCtx* ctx, bool up) {
+	int sel = (int)SendMessageW(ctx->hListKb, LB_GETCURSEL, 0, 0);
+	if (sel == LB_ERR) return;
+	int to = up ? sel-1 : sel+1; if (to < 0 || to >= (int)g_settings.kbDirs.size()) return;
+	std::swap(g_settings.kbDirs[sel], g_settings.kbDirs[to]); SaveSettings(); SettingsRefreshKbList(ctx); SendMessageW(ctx->hListKb, LB_SETCURSEL, to, 0);
+}
+
+static void SettingsAddOrUpdateToken(SettingsCtx* ctx) {
+	wchar_t agent[128]{}; wchar_t token[2048]{};
+	GetWindowTextW(ctx->hEdAgent, agent, 127); GetWindowTextW(ctx->hEdToken, token, 2047);
+	std::wstring a=agent, t=token; if (a.empty()) return;
+	auto it = std::find_if(g_settings.tokens.begin(), g_settings.tokens.end(), [&](const AiTokenPair& p){ return _wcsicmp(p.agent.c_str(), a.c_str())==0; });
+	if (it == g_settings.tokens.end()) g_settings.tokens.push_back({a,t}); else it->token = t;
+	SaveSettings(); SettingsRefreshTokList(ctx);
+}
+
+static void SettingsRemoveSelectedToken(SettingsCtx* ctx) {
+	int sel = (int)SendMessageW(ctx->hListTok, LB_GETCURSEL, 0, 0);
+	if (sel != LB_ERR && sel < (int)g_settings.tokens.size()) { g_settings.tokens.erase(g_settings.tokens.begin()+sel); SaveSettings(); SettingsRefreshTokList(ctx); }
+}
+
+static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	SettingsCtx* ctx = reinterpret_cast<SettingsCtx*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+	switch (msg) {
+	case WM_NCCREATE: {
+		CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+		return TRUE;
+	}
+	case WM_CREATE: {
+		ctx = reinterpret_cast<SettingsCtx*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+		auto Dpi = [&](int v){ return MulDiv(v, g_dpiX, 96); };
+		int margin = Dpi(10);
+		int labelH = Dpi(18);
+		int listW = Dpi(400);
+		int listH1 = Dpi(150);
+		int btnW = Dpi(100);
+		int btnH = Dpi(26);
+		int btnStep = Dpi(30);
+		int rightX = margin + listW + Dpi(10);
+		CreateWindowW(L"STATIC", L"知识库目录：", WS_CHILD | WS_VISIBLE, margin, margin, Dpi(200), labelH, hwnd, (HMENU)(INT_PTR)7001, nullptr, nullptr);
+		ctx->hListKb = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY, margin, margin+labelH+Dpi(4), listW, listH1, hwnd, (HMENU)(INT_PTR)6001, nullptr, nullptr);
+		ctx->hBtnAddKb = CreateWindowW(L"BUTTON", L"添加...", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX, margin+labelH+Dpi(4), btnW, btnH, hwnd, (HMENU)(INT_PTR)6002, nullptr, nullptr);
+		ctx->hBtnRemKb = CreateWindowW(L"BUTTON", L"删除", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX, margin+labelH+Dpi(4)+btnStep, btnW, btnH, hwnd, (HMENU)(INT_PTR)6003, nullptr, nullptr);
+		ctx->hBtnUpKb  = CreateWindowW(L"BUTTON", L"上移", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX, margin+labelH+Dpi(4)+btnStep*2, btnW, btnH, hwnd, (HMENU)(INT_PTR)6004, nullptr, nullptr);
+		ctx->hBtnDownKb= CreateWindowW(L"BUTTON", L"下移", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX, margin+labelH+Dpi(4)+btnStep*3, btnW, btnH, hwnd, (HMENU)(INT_PTR)6005, nullptr, nullptr);
+
+		int y2 = margin+labelH+Dpi(4)+listH1+margin;
+		CreateWindowW(L"STATIC", L"AI Token：", WS_CHILD | WS_VISIBLE, margin, y2, Dpi(200), labelH, hwnd, (HMENU)(INT_PTR)7002, nullptr, nullptr);
+		ctx->hListTok = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY, margin, y2+labelH+Dpi(4), listW, Dpi(140), hwnd, (HMENU)(INT_PTR)6101, nullptr, nullptr);
+		CreateWindowW(L"STATIC", L"Agent:", WS_CHILD | WS_VISIBLE, rightX, y2+labelH+Dpi(4), Dpi(60), Dpi(20), hwnd, (HMENU)(INT_PTR)7003, nullptr, nullptr);
+		ctx->hEdAgent = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, rightX+Dpi(60), y2+labelH+Dpi(2), Dpi(160), Dpi(24), hwnd, (HMENU)(INT_PTR)6102, nullptr, nullptr);
+		CreateWindowW(L"STATIC", L"Token:", WS_CHILD | WS_VISIBLE, rightX, y2+labelH+Dpi(4)+Dpi(28), Dpi(60), Dpi(20), hwnd, (HMENU)(INT_PTR)7004, nullptr, nullptr);
+		ctx->hEdToken = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, rightX+Dpi(60), y2+labelH+Dpi(2)+Dpi(28), Dpi(160), Dpi(24), hwnd, (HMENU)(INT_PTR)6103, nullptr, nullptr);
+		ctx->hBtnTokAdd = CreateWindowW(L"BUTTON", L"添加/更新", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX+Dpi(60), y2+labelH+Dpi(2)+Dpi(28)+Dpi(30), Dpi(160), btnH, hwnd, (HMENU)(INT_PTR)6104, nullptr, nullptr);
+		ctx->hBtnTokRem = CreateWindowW(L"BUTTON", L"删除选中", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX+Dpi(60), y2+labelH+Dpi(2)+Dpi(28)+Dpi(30)+btnStep, Dpi(160), btnH, hwnd, (HMENU)(INT_PTR)6105, nullptr, nullptr);
+		CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP, rightX+Dpi(60), y2+labelH+Dpi(2)+Dpi(28)+Dpi(30)+btnStep*2, Dpi(160), Dpi(28), hwnd, (HMENU)(INT_PTR)6199, nullptr, nullptr);
+
+		SettingsApplyFont(ctx);
+		SettingsRefreshKbList(ctx); SettingsRefreshTokList(ctx);
+		return 0;
+	}
+	case WM_COMMAND: {
+		UINT id = LOWORD(wParam);
+		if (id == 6002) { SettingsAddKbDir(ctx->owner, ctx); return 0; }
+		if (id == 6003) { SettingsRemoveSelectedKb(ctx); return 0; }
+		if (id == 6004) { SettingsMoveKb(ctx, true); return 0; }
+		if (id == 6005) { SettingsMoveKb(ctx, false); return 0; }
+		if (id == 6104) { SettingsAddOrUpdateToken(ctx); return 0; }
+		if (id == 6105) { SettingsRemoveSelectedToken(ctx); return 0; }
+		if (id == 6199) { DestroyWindow(hwnd); return 0; }
+		break;
+	}
+	case WM_CLOSE:
+		DestroyWindow(hwnd); return 0;
+	case WM_DESTROY:
+		EnableWindow(ctx->owner, TRUE); SetForegroundWindow(ctx->owner); return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowSettingsDialog(HWND owner) {
+	static ATOM s_atom = 0; if (!s_atom) { WNDCLASSW wc{}; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"PdfWinViewerSettingsWnd"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); s_atom = RegisterClassW(&wc); }
+	SettingsCtx ctx{}; ctx.owner = owner;
+	int w = MulDiv(660, g_dpiX, 96), h = MulDiv(480, g_dpiY, 96);
+	RECT prc{}; GetWindowRect(owner, &prc); int x = prc.left + 40; int y = prc.top + 40;
+	HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"PdfWinViewerSettingsWnd", L"setting...", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), &ctx);
+	if (!dlg) return; ctx.hwnd = dlg; EnableWindow(owner, FALSE);
+	MSG msg{}; while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) { if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
 }
 
 // TreeView item param
@@ -1156,6 +1404,10 @@ static void ClampScroll(HWND hWnd) {
     g_scrollY = std::min(std::max(0, g_scrollY), maxY);
 }
 
+// 应用启动时载入设置
+struct SettingsAutoLoader { SettingsAutoLoader() { LoadSettings(); } };
+static SettingsAutoLoader g_settingsLoaderOnce;
+
 static void LayoutSidebarAndContent(HWND hWnd) {
     RECT rc{}; GetClientRect(hWnd, &rc);
     int cw = rc.right - rc.left;
@@ -1232,7 +1484,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		AppendMenuW(g_hNavMenu, MF_SEPARATOR, 0, nullptr);
 		AppendMenuW(g_hNavMenu, MF_STRING, ID_NAV_GOTO, L"Go to Page...\tCtrl+G");
 		AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)g_hNavMenu, L"Navigate");
+		// Settings 顶级菜单项，点击直接打开设置窗口
+		AppendMenuW(g_hMenu, MF_STRING, ID_SETTINGS_OPEN, L"Settings...");
 		SetMenu(hWnd, g_hMenu);
+		DrawMenuBar(hWnd);
 		// 启用拖放
 		DragAcceptFiles(hWnd, TRUE);
 		// 左侧书签树
@@ -1340,6 +1595,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (!path.empty()) { OpenDocumentFromPath(hWnd, path); }
 			return 0;
 		}
+		if (id == ID_SETTINGS_OPEN) { ShowSettingsDialog(hWnd); return 0; }
 		// TreeView 通知处理：点击书签跳页
 		if (HIWORD(wParam) == 0 && (HWND)lParam == g_hToc) {
 			// no-op
