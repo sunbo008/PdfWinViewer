@@ -1,0 +1,3 @@
+D:/workspace/pdfium_20250814/PdfWinViewer/build/CMakeFiles/PdfWinViewer.dir
+D:/workspace/pdfium_20250814/PdfWinViewer/build/CMakeFiles/ALL_BUILD.dir
+D:/workspace/pdfium_20250814/PdfWinViewer/build/CMakeFiles/ZERO_CHECK.dir

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <commctrl.h>
 #include <fpdf_doc.h>
 #include <fpdfview.h>
@@ -118,6 +119,27 @@ static void BuildBookmarks(HWND hWnd);
 static void ClearBookmarks();
 static void LayoutSidebarAndContent(HWND hWnd);
 struct TocItemData;
+
+// 简易 COM 智能指针（最小实现）
+template <typename T>
+class ComPtr {
+public:
+	ComPtr() : p_(nullptr) {}
+	~ComPtr() { Reset(); }
+	T** operator&() { Reset(); return &p_; }
+	T* operator->() const { return p_; }
+	T* get() const { return p_; }
+	explicit operator bool() const { return p_ != nullptr; }
+	T* Detach() { T* t = p_; p_ = nullptr; return t; }
+	void Reset(T* np = nullptr) { if (p_) { p_->Release(); } p_ = np; }
+private:
+	T* p_;
+};
+
+// CoTaskMemFree RAII 释放器
+struct CoTaskMemDeleter {
+	void operator()(wchar_t* p) const { if (p) CoTaskMemFree(p); }
+};
 
 // 文本选择与复制
 static bool g_selecting = false;          // 是否正在拖拽选择
@@ -372,24 +394,25 @@ static void SettingsApplyFont(SettingsCtx* ctx) {
 
 static void SettingsAddKbDir(HWND owner, SettingsCtx* ctx) {
 	EnsureCOM();
-	IFileDialog* pfd = nullptr;
+	ComPtr<IFileDialog> pfd;
 	HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd));
 	if (SUCCEEDED(hr) && pfd) {
 		DWORD opt = 0; pfd->GetOptions(&opt); pfd->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
 		if (SUCCEEDED(pfd->Show(owner))) {
-			IShellItem* it = nullptr; if (SUCCEEDED(pfd->GetResult(&it)) && it) {
-				PWSTR psz = nullptr; if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &psz)) && psz) {
-					std::wstring path = psz; CoTaskMemFree(psz);
+			ComPtr<IShellItem> it;
+			if (SUCCEEDED(pfd->GetResult(&it)) && it) {
+				PWSTR pszRaw = nullptr;
+				if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &pszRaw)) && pszRaw) {
+					std::unique_ptr<wchar_t, CoTaskMemDeleter> psz(pszRaw);
+					std::wstring path = psz.get();
 					if (!path.empty()) {
 						// 去重
 						auto itf = std::find_if(g_settings.kbDirs.begin(), g_settings.kbDirs.end(), [&](const std::wstring& s){ return _wcsicmp(s.c_str(), path.c_str())==0; });
 						if (itf == g_settings.kbDirs.end()) { g_settings.kbDirs.push_back(path); SaveSettings(); SettingsRefreshKbList(ctx); }
 					}
 				}
-				it->Release();
 			}
 		}
-		pfd->Release();
 	}
 }
 
@@ -429,7 +452,9 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	}
 	case WM_CREATE: {
 		ctx = reinterpret_cast<SettingsCtx*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-		auto Dpi = [&](int v){ return MulDiv(v, g_dpiX, 96); };
+		if (!ctx) return -1;
+		ctx->hwnd = hwnd;
+		auto Dpi = [&](int v){ return MulDiv(v, ctx->dpiX, 96); };
 		int margin = Dpi(10);
 		int labelH = Dpi(18);
 		int listW = Dpi(400);
@@ -474,19 +499,40 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 	case WM_CLOSE:
 		DestroyWindow(hwnd); return 0;
 	case WM_DESTROY:
-		EnableWindow(ctx->owner, TRUE); SetForegroundWindow(ctx->owner); return 0;
+		if (ctx && ctx->hFont) { DeleteObject(ctx->hFont); ctx->hFont = nullptr; }
+		if (ctx) { EnableWindow(ctx->owner, TRUE); SetForegroundWindow(ctx->owner); }
+		return 0;
+	case WM_NCDESTROY:
+		if (ctx) { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); delete ctx; }
+		return 0;
+	case WM_DPICHANGED: {
+		if (!ctx) break;
+		UINT newDpiX = LOWORD(wParam), newDpiY = HIWORD(wParam);
+		ctx->dpiX = (int)newDpiX; ctx->dpiY = (int)newDpiY;
+		RECT* prc = (RECT*)lParam;
+		SetWindowPos(hwnd, nullptr, prc->left, prc->top, prc->right - prc->left, prc->bottom - prc->top, SWP_NOZORDER | SWP_NOACTIVATE);
+		SettingsApplyFont(ctx);
+		return 0;
+	}
 	}
 	return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 static void ShowSettingsDialog(HWND owner) {
-	static ATOM s_atom = 0; if (!s_atom) { WNDCLASSW wc{}; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"PdfWinViewerSettingsWnd"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); s_atom = RegisterClassW(&wc); }
-	SettingsCtx ctx{}; ctx.owner = owner;
+	static ATOM s_atom = 0; if (!s_atom) { WNDCLASSW wc{}; wc.lpfnWndProc = SettingsWndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"PdfWinViewerSettingsWnd"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); s_atom = RegisterClassW(&wc); }
+	auto ctx = std::make_unique<SettingsCtx>(); ctx->owner = owner; ctx->dpiX = g_dpiX; ctx->dpiY = g_dpiY;
 	int w = MulDiv(660, g_dpiX, 96), h = MulDiv(480, g_dpiY, 96);
 	RECT prc{}; GetWindowRect(owner, &prc); int x = prc.left + 40; int y = prc.top + 40;
-	HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"PdfWinViewerSettingsWnd", L"setting...", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), &ctx);
-	if (!dlg) return; ctx.hwnd = dlg; EnableWindow(owner, FALSE);
+	DWORD style = (WS_OVERLAPPEDWINDOW & ~(WS_MAXIMIZEBOX | WS_THICKFRAME));
+	HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"PdfWinViewerSettingsWnd", L"setting...", style, x, y, w, h, owner, nullptr, GetModuleHandleW(nullptr), ctx.get());
+	if (!dlg) { return; }
+	SetWindowTextW(dlg, L"setting...");
+	ShowWindow(dlg, SW_SHOWNORMAL);
+	UpdateWindow(dlg);
+	EnableWindow(owner, FALSE);
 	MSG msg{}; while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) { if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
+	// WM_NCDESTROY 会负责 delete；此处释放 unique_ptr 所有权避免双删
+	ctx.release();
 }
 
 // TreeView item param
@@ -519,7 +565,11 @@ static void AddBookmarkRecursive(HWND hTree, HTREEITEM hParent, FPDF_DOCUMENT do
             pageIndex = FPDFDest_GetDestPageIndex(doc, dest);
         }
 
-        TocItemData* data = new TocItemData{ pageIndex, dest };
+        // 使用 unique_ptr 管理，再将所有权交给 TreeView（TVITEM.lParam 为长生命周期存储）
+        auto dataPtr = std::make_unique<TocItemData>();
+        dataPtr->pageIndex = pageIndex;
+        dataPtr->dest = dest;
+        TocItemData* data = dataPtr.release();
         TVINSERTSTRUCTW ins{};
         ins.hParent = hParent; ins.hInsertAfter = TVI_LAST;
         ins.item.mask = TVIF_TEXT | TVIF_PARAM;
