@@ -51,6 +51,12 @@ cmake --build build --config Debug --parallel
 
 > CMake 构建后会自动将 `out\XFA\*.dll` 拷贝到可执行目录；若仍有缺失，手动复制 `out\XFA` 下的所有 dll 即可。
 
+### 不想本地构建？
+- 你可以直接从历史提交获取已构建好的运行所需 DLL 文件：
+  - 提交号：`89c1980`
+  - 该提交包含 `build/Debug/` 下运行所需的 `*.dll`（例如 `pdfium.dll`、`v8*.dll` 等）与示例可执行文件，可用于快速运行验证。
+  - 注意：仓库已在后续提交中清理了构建产物（通过 `.gitignore`），因此如需这些 DLL，请在 GitHub 上浏览该提交并下载对应二进制。
+
 ## IDE/.vscode 集成与脚本自动生成
 
 ### .vscode 自动生成与增量合并（支持 Cursor / CodeLLDB）
