@@ -18,6 +18,7 @@
 #include <fpdfview.h>
 #include <fpdf_formfill.h>
 #include <fpdf_edit.h>
+#include <fpdf_text.h>
 
 // 直接使用公共头中的 API：FPDFDest_GetDestPageIndex
 
@@ -73,6 +74,7 @@ static const UINT ID_UPDOWN = 3002;
 static const UINT ID_CTX_EXPORT_PNG = 4001;
 static const UINT ID_CTX_SAVE_IMAGE = 4002;
 static const UINT ID_CTX_PROPERTIES = 4003;
+static const UINT ID_CTX_COPY_TEXT = 4004;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -114,6 +116,130 @@ static void BuildBookmarks(HWND hWnd);
 static void ClearBookmarks();
 static void LayoutSidebarAndContent(HWND hWnd);
 struct TocItemData;
+
+// 文本选择与复制
+static bool g_selecting = false;          // 是否正在拖拽选择
+static bool g_hasSelection = false;       // 是否已有选区
+static POINT g_selStart{};                // 选区起点（客户区坐标）
+static POINT g_selEnd{};                  // 选区终点（客户区坐标）
+static std::wstring g_selectedText;       // 最近一次选中的文本
+static bool g_mouseDown = false;          // 是否按下左键
+static bool g_movedSinceDown = false;     // 从按下以来是否移动过（用于区分点击/拖动）
+static POINT g_mouseDownPt{};             // 记录按下位置
+
+static void ClearSelection(HWND hWnd) {
+	g_selecting = false;
+	g_hasSelection = false;
+	g_selectedText.clear();
+	InvalidateRect(hWnd, nullptr, TRUE);
+}
+
+static RECT GetNormalizedClientRect(POINT a, POINT b) {
+	RECT r{};
+	r.left = std::min(a.x, b.x);
+	r.right = std::max(a.x, b.x);
+	r.top = std::min(a.y, b.y);
+	r.bottom = std::max(a.y, b.y);
+	return r;
+}
+
+// 将客户区坐标转换为 PDF 页面坐标（原点在左下）
+static void ClientToPdfPageXY(POINT client, double& outPageX, double& outPageY, double pageHeightPt) {
+	int contentX = client.x - g_contentOriginX;
+	double pageX = (contentX + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
+	double pageYTopDown = (client.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+	outPageX = pageX;
+	outPageY = std::max(0.0, pageHeightPt - pageYTopDown);
+}
+
+static bool ExtractSelectedTextOnCurrentPage(HWND hWnd, std::wstring& outText) {
+	outText.clear();
+	if (!g_doc) return false;
+	RECT rcClient = GetNormalizedClientRect(g_selStart, g_selEnd);
+	// 限制在内容区域内
+	int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+	int contentLeft = g_contentOriginX;
+	int contentRight = g_contentOriginX + cw;
+	RECT rcLimit{ contentLeft, 0, contentRight, ch };
+	RECT rc = rcClient;
+	if (!IntersectRect(&rc, &rcClient, &rcLimit)) return false;
+
+	double w_pt = 0, h_pt = 0; if (!FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt)) return false;
+	// 将两角转换为 PDF 页面坐标
+	POINT p1{ rc.left, rc.top };
+	POINT p2{ rc.right, rc.bottom };
+	double x1=0, y1=0, x2=0, y2=0;
+	ClientToPdfPageXY(p1, x1, y1, h_pt);
+	ClientToPdfPageXY(p2, x2, y2, h_pt);
+	double left = std::min(x1, x2);
+	double right = std::max(x1, x2);
+	double bottom = std::min(y1, y2);
+	double top = std::max(y1, y2);
+
+	FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
+	if (!page) return false;
+	FPDF_TEXTPAGE textpage = FPDFText_LoadPage(page);
+	if (!textpage) { FPDF_ClosePage(page); return false; }
+
+	int chars = FPDFText_GetBoundedText(textpage, left, top, right, bottom, nullptr, 0);
+	bool ok = false;
+	if (chars > 0) {
+		std::vector<unsigned short> buf((size_t)chars + 1u);
+		int got = FPDFText_GetBoundedText(textpage, left, top, right, bottom, reinterpret_cast<FPDF_WCHAR*>(buf.data()), chars);
+		if (got > 0) {
+			buf[(size_t)got] = 0;
+			outText.assign(reinterpret_cast<wchar_t*>(buf.data()));
+			ok = !outText.empty();
+		}
+	}
+	FPDFText_ClosePage(textpage);
+	FPDF_ClosePage(page);
+	return ok;
+}
+
+static void CopyTextToClipboard(HWND hWnd, const std::wstring& text) {
+	if (text.empty()) return;
+	if (!OpenClipboard(hWnd)) return;
+	EmptyClipboard();
+	size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+	HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+	if (hmem) {
+		void* ptr = GlobalLock(hmem);
+		if (ptr) {
+			memcpy(ptr, text.c_str(), bytes);
+			GlobalUnlock(hmem);
+			SetClipboardData(CF_UNICODETEXT, hmem);
+			// 不要 GlobalFree，交给剪贴板所有权
+		} else {
+			GlobalFree(hmem);
+		}
+	}
+	CloseClipboard();
+}
+
+static void TryNavigateLinkAtPoint(HWND hWnd, POINT clientPt) {
+	if (!g_doc) return;
+	// 将点击位置转换到 PDF 页面坐标
+	double w_pt = 0, h_pt = 0; if (!FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt)) return;
+	double px = 0, py = 0; ClientToPdfPageXY(clientPt, px, py, h_pt);
+	// FPDFLink_GetLinkAtPoint 需要 PDF 页面坐标（原点左下）
+	FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
+	if (!page) return;
+	FPDF_LINK link = FPDFLink_GetLinkAtPoint(page, px, py);
+	if (link) {
+		// 优先取 Dest
+		FPDF_DEST dest = FPDFLink_GetDest(g_doc, link);
+		if (!dest) {
+			FPDF_ACTION act = FPDFLink_GetAction(link);
+			if (act) dest = FPDFAction_GetDest(g_doc, act);
+		}
+		if (dest) {
+			int pageIndex = FPDFDest_GetDestPageIndex(g_doc, dest);
+			if (pageIndex >= 0) SetPageAndRefresh(hWnd, pageIndex);
+		}
+	}
+	FPDF_ClosePage(page);
+}
 
 // TreeView item param
 struct TocItemData { int pageIndex; FPDF_DEST dest; };
@@ -772,6 +898,7 @@ static void SetPageAndRefresh(HWND hWnd, int newIndex) {
 	if (newIndex >= page_count) newIndex = page_count - 1;
 	g_page_index = newIndex;
 	g_scrollX = g_scrollY = 0;
+	ClearSelection(hWnd);
 	RecalcPagePixelSize(hWnd);
 	UpdateScrollBars(hWnd);
 	InvalidateRect(hWnd, nullptr, TRUE);
@@ -1161,6 +1288,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_EXPORT_PNG, L"导出当前页为 PNG...");
 		// 仅当点击位置命中图片时可用；不再提供"回退最大图片"
 		AppendMenuW(hPopup, MF_STRING | ((g_doc && enableSave) ? 0 : MF_GRAYED), ID_CTX_SAVE_IMAGE, L"保存图片...");
+		AppendMenuW(hPopup, MF_STRING | ((g_doc && g_hasSelection) ? 0 : MF_GRAYED), ID_CTX_COPY_TEXT, L"复制文本");
 		AppendMenuW(hPopup, MF_SEPARATOR, 0, nullptr);
 		AppendMenuW(hPopup, MF_STRING | (g_doc ? 0 : MF_GRAYED), ID_CTX_PROPERTIES, L"属性...");
 		int cmd = TrackPopupMenu(hPopup, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, nullptr);
@@ -1180,6 +1308,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 					FPDF_ClosePage(pg);
 				}
 				g_savingImageNow = false;
+			}
+		}
+		else if (cmd == ID_CTX_COPY_TEXT) {
+			if (g_doc && g_hasSelection && !g_selectedText.empty()) {
+				CopyTextToClipboard(hWnd, g_selectedText);
 			}
 		}
 		else if (cmd == ID_CTX_PROPERTIES) {
@@ -1249,6 +1382,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (GetKeyState(VK_CONTROL) & 0x8000) { int pc = FPDF_GetPageCount(g_doc); int idx = PromptGotoPage(hWnd, pc); if (idx >= 0) SetPageAndRefresh(hWnd, idx); return 0; }
 			break;
 		}
+		case 'C': {
+			if ((GetKeyState(VK_CONTROL) & 0x8000) && g_hasSelection && !g_selectedText.empty()) {
+				CopyTextToClipboard(hWnd, g_selectedText);
+				return 0;
+			}
+			break;
+		}
 		}
 		break;
 	}
@@ -1281,23 +1421,44 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		return 0;
 	}
 	case WM_LBUTTONDOWN: {
+		g_mouseDown = true; g_movedSinceDown = false; g_dragging = false; g_selecting = false;
+		g_mouseDownPt.x = GET_X_LPARAM(lParam);
+		g_mouseDownPt.y = GET_Y_LPARAM(lParam);
+		g_lastDragPt = g_mouseDownPt;
+		if (GetKeyState(VK_CONTROL) & 0x8000) {
+			// Ctrl + 左键：平移拖动
+			g_dragging = true;
+		} else {
+			// 仅左键：框选文本
+			g_selecting = true;
+			g_selStart = g_mouseDownPt;
+			g_selEnd = g_mouseDownPt;
+		}
 		SetCapture(hWnd);
-		g_dragging = true;
-		g_lastDragPt.x = GET_X_LPARAM(lParam);
-		g_lastDragPt.y = GET_Y_LPARAM(lParam);
 		return 0;
 	}
 	case WM_MOUSEMOVE: {
+		POINT cur; cur.x = GET_X_LPARAM(lParam); cur.y = GET_Y_LPARAM(lParam);
+		int dx = cur.x - g_lastDragPt.x;
+		int dy = cur.y - g_lastDragPt.y;
 		if (g_dragging) {
-			POINT pt; pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam);
-			int dx = pt.x - g_lastDragPt.x;
-			int dy = pt.y - g_lastDragPt.y;
-			g_lastDragPt = pt;
+			// 必须按住 Ctrl 才允许页面平移
+			if ((GetKeyState(VK_CONTROL) & 0x8000) == 0) {
+				return 0;
+			}
+			g_lastDragPt = cur;
 			// 鼠标向右移动，内容应向右跟随 => 滚动条减少
 			g_scrollX = std::max(0, g_scrollX - dx);
 			g_scrollY = std::max(0, g_scrollY - dy);
 			ClampScroll(hWnd);
 			UpdateScrollBars(hWnd);
+			InvalidateRect(hWnd, nullptr, TRUE);
+			if (std::abs(dx) + std::abs(dy) > 0) g_movedSinceDown = true;
+			return 0;
+		}
+		if (g_selecting) {
+			g_selEnd = cur;
+			g_movedSinceDown = true;
 			InvalidateRect(hWnd, nullptr, TRUE);
 			return 0;
 		}
@@ -1342,10 +1503,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		break;
 	}
 	case WM_LBUTTONUP: {
-		if (g_dragging) {
-			g_dragging = false;
-			releaseCapture:
+		bool wasDragging = g_dragging;
+		bool wasSelecting = g_selecting;
+		g_dragging = false;
+		g_selecting = false;
+		if (GetCapture() == hWnd) {
 			ReleaseCapture();
+		}
+		if (wasSelecting) {
+			if (g_movedSinceDown) {
+				// 完成一次选择并尝试提取文本
+				g_hasSelection = ExtractSelectedTextOnCurrentPage(hWnd, g_selectedText);
+				InvalidateRect(hWnd, nullptr, TRUE);
+				return 0;
+			}
+			// 未移动，当作点击处理
+			POINT upPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+			TryNavigateLinkAtPoint(hWnd, upPt);
+			return 0;
+		}
+		if (!g_movedSinceDown && !wasDragging) {
+			// 视为点击，尝试命中链接
+			POINT upPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+			TryNavigateLinkAtPoint(hWnd, upPt);
+			return 0;
 		}
 		return 0;
 	}
@@ -1356,6 +1537,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	case WM_PAINT: {
 		PAINTSTRUCT ps; HDC hdc = BeginPaint(hWnd, &ps);
 		RenderPageToDC(hWnd, hdc);
+		// 绘制选区高亮
+		if ((g_selecting || g_hasSelection) && g_doc) {
+			EnsureGdiplus();
+			RECT r = GetNormalizedClientRect(g_selStart, g_selEnd);
+			// 限制在内容区域内
+			int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+			RECT content{ g_contentOriginX, 0, g_contentOriginX + cw, ch };
+			RECT drawRc{};
+			if (IntersectRect(&drawRc, &r, &content)) {
+				Gdiplus::Graphics g(hdc);
+				Gdiplus::SolidBrush br(Gdiplus::Color(80, 30, 144, 255)); // 半透明蓝
+				Gdiplus::Rect gr(drawRc.left, drawRc.top, drawRc.right - drawRc.left, drawRc.bottom - drawRc.top);
+				g.FillRectangle(&br, gr);
+			}
+		}
 		EndPaint(hWnd, &ps);
 		return 0;
 	}
