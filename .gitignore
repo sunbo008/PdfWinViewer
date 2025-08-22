@@ -1,0 +1,37 @@
+# Build directories
+/build/
+/x64/
+/Debug/
+/Release/
+/RelWithDebInfo/
+/.vs/
+
+# CMake generated
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/*.sln
+/*.vcxproj
+/*.vcxproj.*
+
+# Binaries
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.obj
+*.idb
+
+# Logs and temp
+*.log
+*.tlog
+*.lastbuildstate
+*.opendb
+*.VC.db
+*.cache
+
+# User/IDE
+*.user
+
