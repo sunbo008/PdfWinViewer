@@ -7,6 +7,8 @@
 #include <shellapi.h>
 #include <gdiplus.h>
 #include <wincodec.h>
+#include <psapi.h>
+#include <Richedit.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -49,6 +51,7 @@ static HWND g_hPageLabel = nullptr;
 static HWND g_hPageEdit = nullptr;
 static HWND g_hPageTotal = nullptr;
 static HWND g_hUpDown = nullptr;
+// 已取消主窗口内的日志工具栏，避免主界面出现"日志"字样
 static bool g_savingImageNow = false;
 static bool g_inFileDialog = false;
 static std::wstring g_currentDocPath; // 当前文档完整路径，仅用于标题栏显示
@@ -58,6 +61,7 @@ static POINT g_lastDragPt{};
 static HWND g_hToc = nullptr;         // 书签树
 static int g_sidebarPx = 0;           // 左侧书签面板宽度（像素）
 static int g_contentOriginX = 0;      // 内容绘制与命中测试的 X 偏移
+static int g_contentOriginY = 0;      // 顶部偏移（不使用工具栏时为 0）
 
 
 static std::vector<std::wstring> g_recent;
@@ -78,6 +82,7 @@ static const UINT ID_CTX_SAVE_IMAGE = 4002;
 static const UINT ID_CTX_PROPERTIES = 4003;
 static const UINT ID_CTX_COPY_TEXT = 4004;
 static const UINT ID_SETTINGS_OPEN = 5001;
+static const UINT ID_VIEW_LOG = 9001;
 
 // Forward declarations for functions used before their definitions
 static void RecalcPagePixelSize(HWND hWnd);
@@ -91,6 +96,8 @@ static void CloseDoc();
 static void InitFormEnv(HWND hWnd);
 static void SetZoom(HWND hWnd, double newZoom, POINT* anchorClient);
 static void RenderPageToDC(HWND hWnd, HDC hdc);
+static void ShowLogWindow(HWND owner);
+static std::wstring MakeProjectRelativePath(const std::wstring& abs);
 static void GetDPI(HWND hWnd);
 static void ClampScroll(HWND hWnd);
 static void FitWindowToPage(HWND hWnd);
@@ -170,8 +177,9 @@ static RECT GetNormalizedClientRect(POINT a, POINT b) {
 // 将客户区坐标转换为 PDF 页面坐标（原点在左下）
 static void ClientToPdfPageXY(POINT client, double& outPageX, double& outPageY, double pageHeightPt) {
 	int contentX = client.x - g_contentOriginX;
+	int contentY = client.y - g_contentOriginY;
 	double pageX = (contentX + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
-	double pageYTopDown = (client.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
+	double pageYTopDown = (contentY + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
 	outPageX = pageX;
 	outPageY = std::max(0.0, pageHeightPt - pageYTopDown);
 }
@@ -535,6 +543,262 @@ static void ShowSettingsDialog(HWND owner) {
 	ctx.release();
 }
 
+// ================= 日志模块与窗口 =================
+#if !defined(PDFWV_ENABLE_LOGGING)
+#define PDFWV_ENABLE_LOGGING 0
+#endif
+
+enum class LogLevel { Critical, Error, Warning, Debug, Trace };
+
+static bool g_logHeaderShown = false; static unsigned long g_logLineIndex = 0;
+
+static const int W_ELAPSED = 12; // includes "[+xx.xxs]"
+static const int W_LVL     = 16; // label+desc
+static const int W_PAGE    = 6;
+static const int W_ZOOM    = 6;
+static const int W_TIME    = 9;
+static const int W_MEM     = 9;
+static const int W_DMEM    = 9;
+static const int W_REMARKS = 48; // remarks/file:line/func
+
+static const wchar_t* LevelToLabel(LogLevel lv) {
+    switch (lv) {
+    case LogLevel::Critical: return L"Critical";
+    case LogLevel::Error:    return L"Error";
+    case LogLevel::Warning:  return L"Warning";
+    case LogLevel::Debug:    return L"Debug";
+    case LogLevel::Trace:    return L"Trace";
+    }
+    return L"Debug";
+}
+
+static const wchar_t* LevelToDesc(LogLevel lv) {
+    switch (lv) {
+    case LogLevel::Critical: return L"致命错误";
+    case LogLevel::Error:    return L"错误";
+    case LogLevel::Warning:  return L"警告";
+    case LogLevel::Debug:    return L"渲染性能";
+    case LogLevel::Trace:    return L"跟踪";
+    }
+    return L"";
+}
+
+static std::wstring NarrowToWideAcp(const char* s) {
+    if (!s) return L"";
+    int len = (int)strlen(s);
+    if (len == 0) return L"";
+    int wlen = MultiByteToWideChar(CP_ACP, 0, s, len, nullptr, 0);
+    std::wstring w; w.resize((size_t)wlen);
+    MultiByteToWideChar(CP_ACP, 0, s, len, w.data(), wlen);
+    return w;
+}
+
+struct Log {
+    static bool& Enabled() noexcept { static bool e = true; return e; }
+    static bool IsEnabled() noexcept { return Enabled(); }
+    static void SetEnabled(bool on) noexcept { Enabled() = on; }
+    static void WriteF(LogLevel lv, const wchar_t* fmt, ...);
+    static void WritePerf(int page, double zoomPct, double timeMs, double memMB, double deltaMB);
+    static void WritePerfEx(int page, double zoomPct, double timeMs, double memMB, double deltaMB, const wchar_t* remarks, const char* file, int line, const char* func);
+    static void Clear();
+    static void Attach(HWND hRichEdit);
+    static void AppendHeader();
+};
+
+#if PDFWV_ENABLE_LOGGING
+  #define LOGF(lv, fmt, ...) do { if (Log::IsEnabled()) Log::WriteF((lv), L##fmt, __VA_ARGS__); } while(0)
+  #define LOGM(lv, msg)      do { if (Log::IsEnabled()) Log::WriteF((lv), L"%s", L##msg); } while(0)
+#else
+  #define LOGF(...) do{}while(0)
+  #define LOGM(...) do{}while(0)
+#endif
+
+static HWND g_hLogWnd=nullptr, g_hLogEdit=nullptr, g_hLogChk=nullptr, g_hLogAuto=nullptr;
+static HWND g_hLogTip=nullptr;
+static LARGE_INTEGER g_qpcFreq{}; static LARGE_INTEGER g_appStartQpc{};
+static void InitTimingOnce() { static bool inited=false; if (!inited) { QueryPerformanceFrequency(&g_qpcFreq); QueryPerformanceCounter(&g_appStartQpc); inited=true; } }
+static LARGE_INTEGER g_openStartQpc{}; static bool g_firstRenderAfterOpen = false;
+
+static HWND& LogRich() { static HWND h=nullptr; return h; }
+void Log::Attach(HWND hRich) { LogRich() = hRich; }
+
+static void AppendColored(HWND hEdit, LogLevel lv, const std::wstring& s, bool autoScroll=true) {
+    if (!hEdit) return;
+    CHARFORMAT2W cf{}; cf.cbSize=sizeof(cf); cf.dwMask = CFM_COLOR | CFM_BOLD | CFM_BACKCOLOR;
+    COLORREF zebra = (g_logLineIndex % 2) ? RGB(236,236,236) : RGB(255,255,255);
+    cf.crBackColor = zebra;
+    switch (lv) {
+    case LogLevel::Critical: cf.crTextColor=RGB(200,0,0); cf.dwEffects=CFE_BOLD; break;
+    case LogLevel::Error:    cf.crTextColor=RGB(220,0,0); cf.dwEffects=0; break;
+    case LogLevel::Warning:  cf.crTextColor=RGB(200,120,0); cf.dwEffects=0; break;
+    case LogLevel::Debug:    cf.crTextColor=RGB(0,90,200);  cf.dwEffects=0; break;
+    case LogLevel::Trace:    cf.crTextColor=RGB(110,110,110); cf.dwEffects=0; break;
+    }
+    SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    SendMessageW(hEdit, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
+    SendMessageW(hEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+    if (autoScroll) {
+        SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
+        SendMessageW(hEdit, WM_VSCROLL, SB_BOTTOM, 0);
+    }
+    ++g_logLineIndex;
+}
+
+void Log::WriteF(LogLevel lv, const wchar_t* fmt, ...) {
+    if (!IsWindow(LogRich())) return;
+    InitTimingOnce();
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    double elapsedMs = (now.QuadPart - g_appStartQpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    wchar_t line[1200]; wchar_t payload[1024];
+    va_list ap; va_start(ap, fmt);
+    _vsnwprintf(payload, 1023, fmt, ap);
+    va_end(ap); payload[1023]=0;
+    swprintf(line, 1199, L"[+%.3fs] %s", elapsedMs/1000.0, payload);
+    bool autoScroll = (g_hLogAuto && BST_CHECKED==SendMessageW(g_hLogAuto,BM_GETCHECK,0,0));
+    AppendColored(LogRich(), lv, line, autoScroll);
+}
+
+void Log::Clear() {
+    if (!IsWindow(LogRich())) return;
+    SetWindowTextW(LogRich(), L"");
+    g_logLineIndex = 0; g_logHeaderShown = false;
+}
+
+void Log::AppendHeader() {
+    if (!IsWindow(LogRich()) || g_logHeaderShown) return;
+    CHARFORMAT2W cf{}; cf.cbSize=sizeof(cf); cf.dwMask = CFM_COLOR | CFM_BACKCOLOR | CFM_BOLD;
+    cf.dwEffects = CFE_BOLD; cf.crTextColor = RGB(30,30,30); cf.crBackColor = RGB(210,210,210);
+    SendMessageW(LogRich(), EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(LogRich(), EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    wchar_t hdr[512];
+    swprintf(hdr, 511, L"%-*ls %-*ls %-*ls %-*ls %-*ls %-*ls %-*ls %-*ls",
+             W_ELAPSED, L"Elapsed",
+             W_LVL,     L"LVL:描述",
+             W_PAGE,    L"page",
+             W_ZOOM,    L"zoom",
+             W_TIME,    L"time(ms)",
+             W_MEM,     L"mem(MB)",
+             W_DMEM,    L"Δmem(MB)",
+             W_REMARKS, L"Remarks");
+    SendMessageW(LogRich(), EM_REPLACESEL, FALSE, (LPARAM)hdr);
+    SendMessageW(LogRich(), EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+    g_logHeaderShown = true; g_logLineIndex = 0;
+}
+
+void Log::WritePerfEx(int page, double zoomPct, double timeMs, double memMB, double deltaMB, const wchar_t* remarks, const char* file, int line, const char* func) {
+    if (!IsWindow(LogRich())) return;
+    InitTimingOnce();
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    double elapsedMs = (now.QuadPart - g_appStartQpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    wchar_t elapsed[32]; swprintf(elapsed, 31, L"[+%7.3fs]", elapsedMs/1000.0);
+    const wchar_t* lvl = LevelToLabel(LogLevel::Debug);
+    const wchar_t* desc = LevelToDesc(LogLevel::Debug);
+    wchar_t lvlcol[48]; swprintf(lvlcol, 47, L"%ls:%ls", lvl, desc);
+    std::wstring filew = NarrowToWideAcp(file);
+    std::wstring funcw = NarrowToWideAcp(func);
+    std::wstring rel = MakeProjectRelativePath(filew);
+    wchar_t src[256]; swprintf(src, 255, L"%ls:%d %ls", rel.c_str(), line, funcw.c_str());
+    wchar_t rem[512]; swprintf(rem, 511, L"%ls%ls%ls", (remarks?remarks:L""), (remarks&&remarks[0]?L" | ":L""), src);
+    // 截断过长的备注（保留列宽），剩余通过 tooltip 查看
+    std::wstring remView = rem;
+    if ((int)remView.size() > W_REMARKS) {
+        remView.resize(W_REMARKS-3); remView += L"...";
+    }
+    wchar_t linebuf[768];
+    swprintf(linebuf, 767, L"%-*ls %-*ls %*d %*.*lf%% %*.*lf %*.*lf %*.*lf %-*ls",
+             W_ELAPSED, elapsed,
+             W_LVL,     lvlcol,
+             W_PAGE,    page,
+             W_ZOOM,    0, zoomPct,
+             W_TIME,    2, timeMs,
+             W_MEM,     2, memMB,
+             W_DMEM,    2, deltaMB,
+             W_REMARKS, remView.c_str());
+    bool autoScroll = (g_hLogAuto && BST_CHECKED==SendMessageW(g_hLogAuto,BM_GETCHECK,0,0));
+    AppendColored(LogRich(), LogLevel::Debug, linebuf, autoScroll);
+    // 设置 RichEdit 提示文本（整行作为 tip）
+    if (!g_hLogTip) {
+        g_hLogTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, L"", WS_POPUP | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, LogRich(), nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetWindowPos(g_hLogTip, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    }
+    TOOLINFOW ti{}; ti.cbSize=sizeof(ti); ti.uFlags = TTF_SUBCLASS; ti.hwnd = LogRich(); ti.uId = 1; ti.lpszText = const_cast<wchar_t*>(rem); GetClientRect(LogRich(), &ti.rect);
+    SendMessageW(g_hLogTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+}
+
+void Log::WritePerf(int page, double zoomPct, double timeMs, double memMB, double deltaMB) {
+    WritePerfEx(page, zoomPct, timeMs, memMB, deltaMB, L"渲染单页统计", __FILE__, __LINE__, __FUNCTION__);
+}
+
+static void ShowLogWindow(HWND owner) {
+#if !PDFWV_ENABLE_LOGGING
+    MessageBeep(MB_ICONINFORMATION);
+    return;
+#else
+    static HMODULE sRiched = LoadLibraryW(L"Msftedit.dll");
+    if (!g_hLogWnd) {
+        WNDCLASSW wc{}; wc.lpfnWndProc = [](HWND hwnd, UINT m, WPARAM w, LPARAM l)->LRESULT {
+            switch (m) {
+            case WM_CREATE: {
+                InitTimingOnce();
+                int x=8,y=8; g_hLogChk = CreateWindowW(L"BUTTON", L"Enable logging", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, x,y,160,24, hwnd,(HMENU)8001,nullptr,nullptr);
+                SendMessageW(g_hLogChk, BM_SETCHECK, Log::IsEnabled()?BST_CHECKED:BST_UNCHECKED, 0);
+                CreateWindowW(L"BUTTON", L"Clear", WS_CHILD|WS_VISIBLE, x+170,y,80,24, hwnd,(HMENU)8002,nullptr,nullptr);
+                g_hLogAuto = CreateWindowW(L"BUTTON", L"Auto-scroll", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, x+260,y,120,24, hwnd,(HMENU)8003,nullptr,nullptr);
+                SendMessageW(g_hLogAuto, BM_SETCHECK, BST_CHECKED, 0);
+                g_hLogEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,
+                    8, 40, 780, 520, hwnd, (HMENU)8004, nullptr, nullptr);
+                // 设置等宽字体并减小页边距
+                CHARFORMAT2W dcf{}; dcf.cbSize=sizeof(dcf); dcf.dwMask=CFM_FACE|CFM_SIZE|CFM_COLOR; dcf.crTextColor=RGB(30,30,30); lstrcpyW(dcf.szFaceName, L"Consolas"); dcf.yHeight=220; // 11pt
+                SendMessageW(g_hLogEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&dcf);
+                SendMessageW(g_hLogEdit, EM_SETMARGINS, EC_LEFTMARGIN|EC_RIGHTMARGIN, MAKELONG(6,6));
+                Log::Attach(g_hLogEdit);
+                Log::AppendHeader();
+                return 0; }
+            case WM_ERASEBKGND: {
+                HDC hdc = (HDC)w;
+                RECT rc; GetClientRect(hwnd, &rc);
+                FillRect(hdc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+                // 顶部按钮区到日志之间的整条带状背景
+                RECT head{0,0,rc.right,40}; FillRect(hdc, &head, GetSysColorBrush(COLOR_BTNFACE));
+                return 1; }
+            case WM_SHOWWINDOW: {
+                if (w) {
+                    HDC hdc = GetDC(hwnd);
+                    SIZE sz; GetTextExtentPoint32W(hdc, L"W", 1, &sz); // approx width per char
+                    ReleaseDC(hwnd, hdc);
+                    int charW = std::max(8, (int)sz.cx);
+                    int minW = 20 + (W_ELAPSED + W_LVL + W_PAGE + W_ZOOM + W_TIME + W_MEM + W_DMEM + W_REMARKS + 6) * charW;
+                    RECT wr; GetWindowRect(hwnd, &wr);
+                    int curW = wr.right - wr.left; int curH = wr.bottom - wr.top;
+                    if (curW < minW) SetWindowPos(hwnd, nullptr, wr.left, wr.top, minW, curH, SWP_NOZORDER|SWP_NOACTIVATE);
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+                return 0; }
+            case WM_SIZE: {
+                RECT rc; GetClientRect(hwnd,&rc);
+                SetWindowPos(g_hLogEdit,nullptr,8,40,rc.right-16,rc.bottom-48,SWP_NOZORDER);
+                InvalidateRect(g_hLogEdit, nullptr, TRUE);
+                UpdateWindow(g_hLogEdit);
+                return 0; }
+            case WM_COMMAND: {
+                UINT id=LOWORD(w);
+                if (id==8001) Log::SetEnabled(BST_CHECKED==SendMessageW(g_hLogChk,BM_GETCHECK,0,0));
+                if (id==8002) Log::Clear();
+                return 0; }
+            case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+            }
+            return DefWindowProcW(hwnd,m,w,l);
+        };
+        wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"PdfWVLogWnd"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1);
+        RegisterClassW(&wc);
+        g_hLogWnd = CreateWindowW(L"PdfWVLogWnd", L"日志", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, 820, 620, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    ShowWindow(g_hLogWnd, SW_SHOWNOACTIVATE);
+    SetForegroundWindow(g_hLogWnd);
+#endif
+}
+
 // TreeView item param
 struct TocItemData { int pageIndex; FPDF_DEST dest; };
 
@@ -644,6 +908,8 @@ static void GetContentClientSize(HWND hWnd, int& outWidth, int& outHeight) {
 	RECT rc{}; GetClientRect(hWnd, &rc);
 	int cw = std::max(1, (int)(rc.right - rc.left));
 	int ch = std::max(1, (int)(rc.bottom - rc.top));
+	// 不再预留顶部工具栏高度
+	g_contentOriginY = 0;
 	if (g_hStatus) {
 		RECT rs{}; GetWindowRect(g_hStatus, &rs);
 		int sbH = rs.bottom - rs.top;
@@ -808,6 +1074,10 @@ static void RenderPageToDC(HWND hWnd, HDC hdc) {
 	if (g_page_index < 0) g_page_index = 0;
 	if (g_page_index >= page_count) g_page_index = page_count - 1;
 	int cw = 0, ch = 0; GetContentClientSize(hWnd, cw, ch);
+	// 性能计时开始
+	#if PDFWV_ENABLE_LOGGING
+	LARGE_INTEGER _pf, _t0, _t1; QueryPerformanceFrequency(&_pf); QueryPerformanceCounter(&_t0);
+	#endif
 	FPDF_PAGE page = FPDF_LoadPage(g_doc, g_page_index);
 	if (!page) return;
 	FPDF_BITMAP bmp = FPDFBitmap_Create(cw, ch, 1);
@@ -819,10 +1089,32 @@ static void RenderPageToDC(HWND hWnd, HDC hdc) {
 		BITMAPINFO bmi{}; bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 		bmi.bmiHeader.biWidth = cw; bmi.bmiHeader.biHeight = -ch; bmi.bmiHeader.biPlanes = 1;
 		bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BI_RGB;
-		StretchDIBits(hdc, g_contentOriginX, 0, cw, ch, 0, 0, cw, ch, buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
+		StretchDIBits(hdc, g_contentOriginX, g_contentOriginY, cw, ch, 0, 0, cw, ch, buffer, &bmi, DIB_RGB_COLORS, SRCCOPY);
 		FPDFBitmap_Destroy(bmp);
 	}
 	FPDF_ClosePage(page);
+	#if PDFWV_ENABLE_LOGGING
+	QueryPerformanceCounter(&_t1);
+	double ms = (_t1.QuadPart - _t0.QuadPart) * 1000.0 / (double)_pf.QuadPart;
+	PROCESS_MEMORY_COUNTERS_EX pmc{};
+	static SIZE_T s_prevPriv = 0;
+	if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+		double curMB = pmc.PrivateUsage / (1024.0*1024.0);
+		double prevMB = s_prevPriv / (1024.0*1024.0);
+		double dMB = curMB - prevMB;
+		s_prevPriv = pmc.PrivateUsage;
+		if (Log::IsEnabled()) {
+			if (g_firstRenderAfterOpen) {
+				LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+				double openMs = (now.QuadPart - g_openStartQpc.QuadPart) * 1000.0 / (double)_pf.QuadPart;
+				Log::WritePerfEx(g_page_index+1, g_zoom*100.0, openMs, curMB, dMB, L"打开PDF→首次渲染", __FILE__, __LINE__, __FUNCTION__);
+				g_firstRenderAfterOpen = false;
+			} else {
+				Log::WritePerf(g_page_index+1, g_zoom*100.0, ms, curMB, dMB);
+			}
+		}
+	}
+	#endif
 }
 
 static void EnsureGdiplus() {
@@ -1288,6 +1580,7 @@ static std::wstring OpenPDFDialog(HWND hWnd) {
 static bool OpenDocumentFromPath(HWND hWnd, const std::wstring& path) {
     if (path.empty()) return false;
     CloseDoc();
+    QueryPerformanceCounter(&g_openStartQpc); g_firstRenderAfterOpen = true;
     std::string u8 = WideToUTF8(path);
     g_doc = FPDF_LoadDocument(u8.c_str(), nullptr);
     if (!g_doc) return false;
@@ -1462,6 +1755,7 @@ static void LayoutSidebarAndContent(HWND hWnd) {
     RECT rc{}; GetClientRect(hWnd, &rc);
     int cw = rc.right - rc.left;
     int ch = rc.bottom - rc.top;
+    // 不再考虑顶部工具栏
     int statusH = 0;
     if (g_hStatus) {
         RECT rs{}; GetWindowRect(g_hStatus, &rs);
@@ -1536,6 +1830,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)g_hNavMenu, L"Navigate");
 		// Settings 顶级菜单项，点击直接打开设置窗口
 		AppendMenuW(g_hMenu, MF_STRING, ID_SETTINGS_OPEN, L"Settings...");
+		// 视图菜单（可选）：日志窗口
+		g_hSettingsMenu = CreatePopupMenu();
+		AppendMenuW(g_hSettingsMenu, MF_STRING, ID_VIEW_LOG, L"Log Window");
+		AppendMenuW(g_hMenu, MF_POPUP, (UINT_PTR)g_hSettingsMenu, L"View");
 		SetMenu(hWnd, g_hMenu);
 		DrawMenuBar(hWnd);
 		// 启用拖放
@@ -1546,7 +1844,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			0, 0, 200, 100, hWnd, (HMENU)(INT_PTR)20001, GetModuleHandleW(nullptr), nullptr);
 		// 拦截书签树上的翻页快捷键，转发到主窗口
 		SetWindowSubclass(g_hToc, TocSubclassProc, 0, (DWORD_PTR)hWnd);
-		// 状态栏与页码控件
+		// 状态栏与页码控件（不创建主窗口内的工具栏）
 		INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES };
 		InitCommonControlsEx(&icc);
 		g_hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hWnd, (HMENU)(INT_PTR)100, GetModuleHandleW(nullptr), nullptr);
@@ -1646,6 +1944,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			return 0;
 		}
 		if (id == ID_SETTINGS_OPEN) { ShowSettingsDialog(hWnd); return 0; }
+		if (id == ID_VIEW_LOG) { ShowLogWindow(hWnd); return 0; }
 		// TreeView 通知处理：点击书签跳页
 		if (HIWORD(wParam) == 0 && (HWND)lParam == g_hToc) {
 			// no-op
@@ -1859,8 +2158,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 		}
 		EndPaint(hWnd, &ps);
-		return 0;
-	}
+		return 0; }
 	case WM_DESTROY: {
 		if (g_gdiplusToken) { Gdiplus::GdiplusShutdown(g_gdiplusToken); g_gdiplusToken = 0; }
 		CloseDoc();
@@ -1883,4 +2181,14 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
 	UpdateWindow(hWnd);
 	MSG msg; while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 	return 0;
+}
+
+static std::wstring MakeProjectRelativePath(const std::wstring& abs) {
+    // 以可执行所在目录的父目录作为项目根简化显示
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::filesystem::path root = std::filesystem::path(exe).parent_path().parent_path();
+    std::error_code ec; std::filesystem::path p(abs);
+    std::filesystem::path rel = std::filesystem::relative(p, root, ec);
+    if (!ec) return rel.wstring();
+    return p.filename().wstring();
 }

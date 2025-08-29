@@ -6,19 +6,34 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 可通过 -DPDFIUM_ROOT=... 覆盖
+# PDFium 路径配置：可通过 -DPDFIUM_ROOT 与 -DPDFIUM_OUT 指定
 set(PDFIUM_ROOT "${CMAKE_SOURCE_DIR}/../pdfium" CACHE PATH "PDFium root")
-set(PDFIUM_BIN  "${PDFIUM_ROOT}/bin" CACHE PATH "PDFium bin dir containing pdfium.dll")
-set(PDFIUM_LIB  "${PDFIUM_ROOT}/lib" CACHE PATH "PDFium lib dir containing import lib")
+set(PDFIUM_OUT  "${PDFIUM_ROOT}/out/XFA" CACHE PATH "PDFium output dir (contains pdfium.dll)")
+# 允许优先使用 PDFIUM_OUT（更贴近官方 out/XFA 目录布局）
+# 若 out/XFA 下不存在 import lib，则同时回退查找 ${PDFIUM_ROOT}/lib
+set(PDFIUM_BIN  "${PDFIUM_OUT}" CACHE PATH "PDFium bin dir containing pdfium.dll")
+set(PDFIUM_LIB_HINT1  "${PDFIUM_OUT}")
+set(PDFIUM_LIB_HINT2  "${PDFIUM_ROOT}/lib")
+if (EXISTS "${PDFIUM_LIB_HINT1}/pdfium.dll.lib")
+  set(PDFIUM_LIB "${PDFIUM_LIB_HINT1}")
+elseif (EXISTS "${PDFIUM_LIB_HINT2}/pdfium.dll.lib")
+  set(PDFIUM_LIB "${PDFIUM_LIB_HINT2}")
+else()
+  set(PDFIUM_LIB "${PDFIUM_OUT}")
+endif()
 set(PDFIUM_IMPORT_LIB "${PDFIUM_LIB}/pdfium.dll.lib")
 
 add_executable(PdfWinViewer WIN32
   PdfWinViewer/Main.cpp
 )
 
-target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX)
+# 日志编译期开关（Debug 默认启用，Release 默认关闭；可通过 -DPDFWV_ENABLE_LOGGING=0/1 覆盖）
+option(PDFWV_ENABLE_LOGGING "Enable in-app logging" OFF)
+target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX PDFWV_ENABLE_LOGGING=$<IF:$<CONFIG:Debug>,1,$<BOOL:${PDFWV_ENABLE_LOGGING}>>)
 
 target_include_directories(PdfWinViewer PRIVATE
-  "${PDFIUM_ROOT}/include"
+  "${PDFIUM_ROOT}/public"
+  "${PDFIUM_ROOT}/include" # 兼容某些发行包/旧布局
 )
 
 target_link_directories(PdfWinViewer PRIVATE "${PDFIUM_LIB}")
@@ -30,26 +45,29 @@ target_link_libraries(PdfWinViewer PRIVATE
   comdlg32
   shlwapi
   shell32
+  psapi
 )
 
-# 拷贝 PDFium 运行时 dll 到目标输出目录
-add_custom_command(TARGET PdfWinViewer POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E echo "Copying PDFium DLLs..."
-  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PdfWinViewer>"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${PDFIUM_BIN}/pdfium.dll
-          "$<TARGET_FILE_DIR:PdfWinViewer>"
-)
-
-# 可选：拷贝同目录其他依赖 dll（采用通配处理，若失败则忽略）
-file(GLOB PDFIUM_DLLS "${PDFIUM_BIN}/*.dll")
-foreach(dll ${PDFIUM_DLLS})
+find_file(PDFIUM_DLL_FILE NAMES pdfium.dll PATHS "${PDFIUM_OUT}" "${PDFIUM_ROOT}/out/XFA" "${PDFIUM_ROOT}/bin" NO_DEFAULT_PATH)
+if (NOT PDFIUM_DLL_FILE)
+  message(WARNING "pdfium.dll not found in PDFIUM_OUT or PDFIUM_ROOT/bin; skip copy.")
+else()
+  get_filename_component(PDFIUM_DLL_DIR "${PDFIUM_DLL_FILE}" DIRECTORY)
+  # 容错式批量复制：使用 PowerShell 一次性复制 *.dll，忽略单个错误并强制返回 0
   add_custom_command(TARGET PdfWinViewer POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${dll}"
-            "$<TARGET_FILE_DIR:PdfWinViewer>"
+    COMMAND ${CMAKE_COMMAND} -E echo "Copying PDFium DLLs from ${PDFIUM_DLL_DIR}..."
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:PdfWinViewer>"
+    COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command "\
+      $src='${PDFIUM_DLL_DIR}'; \
+      $dst='$<TARGET_FILE_DIR:PdfWinViewer>'; \
+      if (Test-Path -LiteralPath $src) { \
+        Get-ChildItem -LiteralPath $src -Filter *.dll -File -ErrorAction SilentlyContinue | ForEach-Object { \
+          try { Copy-Item -LiteralPath $_.FullName -Destination $dst -Force -ErrorAction SilentlyContinue } catch { } \
+        } \
+      }; \
+      exit 0"
   )
-endforeach()
+endif()
 
 # 生成 VS Code 配置（仅在不存在时生成，避免覆盖手动配置）
 option(GENERATE_VSCODE "Generate .vscode files on configure" ON)
