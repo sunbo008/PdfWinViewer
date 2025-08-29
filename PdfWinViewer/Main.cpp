@@ -98,6 +98,9 @@ static void SetZoom(HWND hWnd, double newZoom, POINT* anchorClient);
 static void RenderPageToDC(HWND hWnd, HDC hdc);
 static void ShowLogWindow(HWND owner);
 static std::wstring MakeProjectRelativePath(const std::wstring& abs);
+static std::wstring MakeProjectAbsolutePath(const std::wstring& rel);
+static bool ParseSourceRef(const std::wstring& text, std::wstring& outRel, int& outLine);
+static bool TryOpenInCursor(const std::wstring& absPath, int line);
 static void GetDPI(HWND hWnd);
 static void ClampScroll(HWND hWnd);
 static void FitWindowToPage(HWND hWnd);
@@ -818,6 +821,32 @@ static void ShowLogWindow(HWND owner) {
                 if (id==8001) Log::SetEnabled(BST_CHECKED==SendMessageW(g_hLogChk,BM_GETCHECK,0,0));
                 if (id==8002) Log::Clear();
                 return 0; }
+            case WM_NOTIFY: {
+                LPNMHDR hdr = (LPNMHDR)l;
+                if (hdr && hdr->hwndFrom == g_hLogList) {
+                    if (hdr->code == NM_DBLCLK || hdr->code == LVN_ITEMACTIVATE) {
+                        LPNMITEMACTIVATE pia = (LPNMITEMACTIVATE)l;
+                        int row = pia->iItem;
+                        int col = pia->iSubItem;
+                        if (row >= 0 && (col == 7 || col == -1)) {
+                            wchar_t buf[1024]; buf[0] = 0;
+                            ListView_GetItemText(g_hLogList, row, 7, buf, 1023);
+                            std::wstring rel; int lineNo = -1;
+                            if (ParseSourceRef(buf, rel, lineNo) && lineNo > 0) {
+                                std::wstring abs = MakeProjectAbsolutePath(rel);
+                                if (!abs.empty() && std::filesystem::exists(abs)) {
+                                    if (!TryOpenInCursor(abs, lineNo)) MessageBeep(MB_ICONWARNING);
+                                } else {
+                                    MessageBeep(MB_ICONWARNING);
+                                }
+                            } else {
+                                MessageBeep(MB_ICONWARNING);
+                            }
+                        }
+                        return 0;
+                    }
+                }
+                break; }
             case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
             }
             return DefWindowProcW(hwnd,m,w,l);
@@ -2223,6 +2252,65 @@ static std::wstring MakeProjectRelativePath(const std::wstring& abs) {
     std::filesystem::path rel = std::filesystem::relative(p, root, ec);
     if (!ec) return rel.wstring();
     return p.filename().wstring();
+}
+
+static std::wstring MakeProjectAbsolutePath(const std::wstring& rel) {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::filesystem::path root = std::filesystem::path(exe).parent_path().parent_path();
+    std::filesystem::path abs = root / std::filesystem::path(rel);
+    std::error_code ec; auto canon = std::filesystem::weakly_canonical(abs, ec);
+    return ec ? abs.wstring() : canon.wstring();
+}
+
+static bool ParseSourceRef(const std::wstring& text, std::wstring& outRel, int& outLine) {
+    outRel.clear(); outLine = -1;
+    size_t bar = text.rfind(L'|');
+    size_t start = (bar == std::wstring::npos) ? 0 : (bar + 1);
+    while (start < text.size() && iswspace(text[start])) ++start;
+
+    size_t colon = text.find(L':', start);
+    if (colon == std::wstring::npos) return false;
+
+    std::wstring path = text.substr(start, colon - start);
+    size_t p = colon + 1, n = text.size();
+    int line = 0, digits = 0;
+    while (p < n && iswdigit(text[p])) { line = line * 10 + (text[p] - L'0'); ++p; ++digits; }
+    if (digits == 0) return false;
+
+    auto trim = [](std::wstring& s) {
+        size_t a = 0, b = s.size();
+        while (a < b && iswspace(s[a])) ++a;
+        while (b > a && iswspace(s[b-1])) --b;
+        s = s.substr(a, b - a);
+    };
+    trim(path);
+
+    auto ends_with_ci = [](const std::wstring& s, const wchar_t* suf) {
+        size_t ls = s.size(), lr = wcslen(suf);
+        if (ls < lr) return false;
+        return _wcsicmp(s.c_str() + (ls - lr), suf) == 0;
+    };
+    if (!ends_with_ci(path, L".cpp")) return false;
+
+    outRel = path; outLine = line; return true;
+}
+
+static bool TryOpenInCursor(const std::wstring& absPath, int line) {
+    std::wstring arg = L"-g \"" + absPath + L":" + std::to_wstring(line) + L"\"";
+    HINSTANCE h1 = ShellExecuteW(nullptr, L"open", L"cursor", arg.c_str(), nullptr, SW_SHOWNORMAL);
+    if ((UINT_PTR)h1 > 32) return true;
+
+    HINSTANCE h2 = ShellExecuteW(nullptr, L"open", L"code", arg.c_str(), nullptr, SW_SHOWNORMAL);
+    if ((UINT_PTR)h2 > 32) return true;
+
+    std::wstring pathUri = absPath; for (auto& ch : pathUri) if (ch == L'\\') ch = L'/';
+    std::wstring uri1 = L"cursor://file/" + pathUri + L":" + std::to_wstring(line);
+    HINSTANCE h3 = ShellExecuteW(nullptr, L"open", uri1.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if ((UINT_PTR)h3 > 32) return true;
+
+    std::wstring uri2 = L"vscode://file/" + pathUri + L":" + std::to_wstring(line);
+    HINSTANCE h4 = ShellExecuteW(nullptr, L"open", uri2.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    return (UINT_PTR)h4 > 32;
 }
 
 static void AdjustLogColumns() {
