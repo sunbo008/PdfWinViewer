@@ -613,8 +613,10 @@ struct Log {
   #define LOGM(...) do{}while(0)
 #endif
 
-static HWND g_hLogWnd=nullptr, g_hLogEdit=nullptr, g_hLogChk=nullptr, g_hLogAuto=nullptr;
+static HWND g_hLogWnd=nullptr, g_hLogEdit=nullptr, g_hLogChk=nullptr, g_hLogAuto=nullptr; // legacy
+static HWND g_hLogList=nullptr; // ListView (table mode)
 static HWND g_hLogTip=nullptr;
+static void AdjustLogColumns();
 static LARGE_INTEGER g_qpcFreq{}; static LARGE_INTEGER g_appStartQpc{};
 static void InitTimingOnce() { static bool inited=false; if (!inited) { QueryPerformanceFrequency(&g_qpcFreq); QueryPerformanceCounter(&g_appStartQpc); inited=true; } }
 static LARGE_INTEGER g_openStartQpc{}; static bool g_firstRenderAfterOpen = false;
@@ -666,6 +668,7 @@ void Log::Clear() {
 }
 
 void Log::AppendHeader() {
+    if (g_hLogList && IsWindow(g_hLogList)) { g_logHeaderShown = true; return; }
     if (!IsWindow(LogRich()) || g_logHeaderShown) return;
     CHARFORMAT2W cf{}; cf.cbSize=sizeof(cf); cf.dwMask = CFM_COLOR | CFM_BACKCOLOR | CFM_BOLD;
     cf.dwEffects = CFE_BOLD; cf.crTextColor = RGB(30,30,30); cf.crBackColor = RGB(210,210,210);
@@ -687,6 +690,33 @@ void Log::AppendHeader() {
 }
 
 void Log::WritePerfEx(int page, double zoomPct, double timeMs, double memMB, double deltaMB, const wchar_t* remarks, const char* file, int line, const char* func) {
+    if (g_hLogList && IsWindow(g_hLogList)) {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); if (!g_qpcFreq.QuadPart) InitTimingOnce();
+        double elapsedMs = (now.QuadPart - g_appStartQpc.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+        wchar_t elapsed[32]; swprintf(elapsed, 31, L"%7.3f s", elapsedMs/1000.0);
+        wchar_t lvlcol[48]; swprintf(lvlcol, 47, L"%ls:%ls", LevelToLabel(LogLevel::Debug), LevelToDesc(LogLevel::Debug));
+        wchar_t zoom[16];  swprintf(zoom, 15, L"%.0f%%", zoomPct);
+        wchar_t tms[32];   swprintf(tms, 31, L"%.2f", timeMs);
+        wchar_t mem[32];   swprintf(mem, 31, L"%.2f", memMB);
+        wchar_t dmem[32];  swprintf(dmem, 31, L"%+.2f", deltaMB);
+        std::wstring rel = MakeProjectRelativePath(NarrowToWideAcp(file));
+        wchar_t src[256]; swprintf(src, 255, L"%ls:%d %ls", rel.c_str(), line, NarrowToWideAcp(func).c_str());
+        wchar_t rem[512]; swprintf(rem, 511, L"%ls%ls%ls", (remarks?remarks:L""), (remarks&&remarks[0]?L" | ":L""), src);
+        LVITEMW it{}; it.mask = LVIF_TEXT; it.iItem = ListView_GetItemCount(g_hLogList); it.iSubItem = 0; it.pszText = elapsed; int row = ListView_InsertItem(g_hLogList, &it);
+        ListView_SetItemText(g_hLogList, row, 1, lvlcol);
+        wchar_t bufPage[16]; swprintf(bufPage, 15, L"%d", page); ListView_SetItemText(g_hLogList, row, 2, bufPage);
+        ListView_SetItemText(g_hLogList, row, 3, zoom);
+        ListView_SetItemText(g_hLogList, row, 4, tms);
+        ListView_SetItemText(g_hLogList, row, 5, mem);
+        ListView_SetItemText(g_hLogList, row, 6, dmem);
+        ListView_SetItemText(g_hLogList, row, 7, rem);
+        if (g_hLogTip) {
+            TOOLINFOW ti{}; ti.cbSize=sizeof(ti); ti.uFlags = TTF_SUBCLASS; ti.hwnd = g_hLogList; ti.uId = 2; ti.lpszText = rem; GetClientRect(g_hLogList, &ti.rect); SendMessageW(g_hLogTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+        }
+        if (g_hLogAuto && BST_CHECKED==SendMessageW(g_hLogAuto,BM_GETCHECK,0,0)) ListView_EnsureVisible(g_hLogList, row, FALSE);
+        return;
+    }
+    // fallback to RichEdit
     if (!IsWindow(LogRich())) return;
     InitTimingOnce();
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
@@ -694,21 +724,17 @@ void Log::WritePerfEx(int page, double zoomPct, double timeMs, double memMB, dou
     wchar_t elapsed[32]; swprintf(elapsed, 31, L"[+%7.3fs]", elapsedMs/1000.0);
     const wchar_t* lvl = LevelToLabel(LogLevel::Debug);
     const wchar_t* desc = LevelToDesc(LogLevel::Debug);
-    wchar_t lvlcol[48]; swprintf(lvlcol, 47, L"%ls:%ls", lvl, desc);
+    wchar_t lvlcol2[48]; swprintf(lvlcol2, 47, L"%ls:%ls", lvl, desc);
     std::wstring filew = NarrowToWideAcp(file);
     std::wstring funcw = NarrowToWideAcp(func);
     std::wstring rel = MakeProjectRelativePath(filew);
-    wchar_t src[256]; swprintf(src, 255, L"%ls:%d %ls", rel.c_str(), line, funcw.c_str());
-    wchar_t rem[512]; swprintf(rem, 511, L"%ls%ls%ls", (remarks?remarks:L""), (remarks&&remarks[0]?L" | ":L""), src);
-    // 截断过长的备注（保留列宽），剩余通过 tooltip 查看
-    std::wstring remView = rem;
-    if ((int)remView.size() > W_REMARKS) {
-        remView.resize(W_REMARKS-3); remView += L"...";
-    }
+    wchar_t src2[256]; swprintf(src2, 255, L"%ls:%d %ls", rel.c_str(), line, funcw.c_str());
+    wchar_t rem2[512]; swprintf(rem2, 511, L"%ls%ls%ls", (remarks?remarks:L""), (remarks&&remarks[0]?L" | ":L""), src2);
+    std::wstring remView = rem2; if ((int)remView.size() > W_REMARKS) { remView.resize(W_REMARKS-3); remView += L"..."; }
     wchar_t linebuf[768];
-    swprintf(linebuf, 767, L"%-*ls %-*ls %*d %*.*lf%% %*.*lf %*.*lf %*.*lf %-*ls",
+    swprintf(linebuf, 767, L"%-*ls %-*ls %-*d %-*.*lf%% %-*.*lf %-*.*lf %-*.*lf %-*ls",
              W_ELAPSED, elapsed,
-             W_LVL,     lvlcol,
+             W_LVL,     lvlcol2,
              W_PAGE,    page,
              W_ZOOM,    0, zoomPct,
              W_TIME,    2, timeMs,
@@ -717,13 +743,6 @@ void Log::WritePerfEx(int page, double zoomPct, double timeMs, double memMB, dou
              W_REMARKS, remView.c_str());
     bool autoScroll = (g_hLogAuto && BST_CHECKED==SendMessageW(g_hLogAuto,BM_GETCHECK,0,0));
     AppendColored(LogRich(), LogLevel::Debug, linebuf, autoScroll);
-    // 设置 RichEdit 提示文本（整行作为 tip）
-    if (!g_hLogTip) {
-        g_hLogTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, L"", WS_POPUP | TTS_ALWAYSTIP, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, LogRich(), nullptr, GetModuleHandleW(nullptr), nullptr);
-        SetWindowPos(g_hLogTip, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-    }
-    TOOLINFOW ti{}; ti.cbSize=sizeof(ti); ti.uFlags = TTF_SUBCLASS; ti.hwnd = LogRich(); ti.uId = 1; ti.lpszText = const_cast<wchar_t*>(rem); GetClientRect(LogRich(), &ti.rect);
-    SendMessageW(g_hLogTip, TTM_ADDTOOL, 0, (LPARAM)&ti);
 }
 
 void Log::WritePerf(int page, double zoomPct, double timeMs, double memMB, double deltaMB) {
@@ -746,12 +765,24 @@ static void ShowLogWindow(HWND owner) {
                 CreateWindowW(L"BUTTON", L"Clear", WS_CHILD|WS_VISIBLE, x+170,y,80,24, hwnd,(HMENU)8002,nullptr,nullptr);
                 g_hLogAuto = CreateWindowW(L"BUTTON", L"Auto-scroll", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, x+260,y,120,24, hwnd,(HMENU)8003,nullptr,nullptr);
                 SendMessageW(g_hLogAuto, BM_SETCHECK, BST_CHECKED, 0);
-                g_hLogEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,
-                    8, 40, 780, 520, hwnd, (HMENU)8004, nullptr, nullptr);
-                // 设置等宽字体并减小页边距
-                CHARFORMAT2W dcf{}; dcf.cbSize=sizeof(dcf); dcf.dwMask=CFM_FACE|CFM_SIZE|CFM_COLOR; dcf.crTextColor=RGB(30,30,30); lstrcpyW(dcf.szFaceName, L"Consolas"); dcf.yHeight=220; // 11pt
-                SendMessageW(g_hLogEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&dcf);
-                SendMessageW(g_hLogEdit, EM_SETMARGINS, EC_LEFTMARGIN|EC_RIGHTMARGIN, MAKELONG(6,6));
+                // 新：ListView 表格
+                INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&icc);
+                g_hLogList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS, 8,40,780,520, hwnd, (HMENU)8101, GetModuleHandleW(nullptr), nullptr);
+                ListView_SetExtendedListViewStyle(g_hLogList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_LABELTIP | LVS_EX_DOUBLEBUFFER);
+                // 定义列
+                auto addCol=[&](int idx, int width, const wchar_t* text){ LVCOLUMNW c{}; c.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM; c.cx=width; c.pszText=(LPWSTR)text; c.iSubItem=idx; ListView_InsertColumn(g_hLogList, idx, &c); };
+                addCol(0, 120, L"Elapsed");
+                addCol(1, 140, L"LVL:描述");
+                addCol(2, 60,  L"page");
+                addCol(3, 70,  L"zoom");
+                addCol(4, 90,  L"time(ms)");
+                addCol(5, 90,  L"mem(MB)");
+                addCol(6, 100, L"Δmem(MB)");
+                addCol(7, 520, L"Remarks");
+                AdjustLogColumns();
+                // 旧 RichEdit 隐藏保留（便于将来纯文本导出）
+                g_hLogEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", L"", WS_CHILD|ES_MULTILINE|ES_READONLY, 8, 40, 780, 520, hwnd, (HMENU)8004, nullptr, nullptr);
+                ShowWindow(g_hLogEdit, SW_HIDE);
                 Log::Attach(g_hLogEdit);
                 Log::AppendHeader();
                 return 0; }
@@ -772,14 +803,15 @@ static void ShowLogWindow(HWND owner) {
                     RECT wr; GetWindowRect(hwnd, &wr);
                     int curW = wr.right - wr.left; int curH = wr.bottom - wr.top;
                     if (curW < minW) SetWindowPos(hwnd, nullptr, wr.left, wr.top, minW, curH, SWP_NOZORDER|SWP_NOACTIVATE);
+                    AdjustLogColumns();
                     InvalidateRect(hwnd, nullptr, TRUE);
                 }
                 return 0; }
             case WM_SIZE: {
                 RECT rc; GetClientRect(hwnd,&rc);
-                SetWindowPos(g_hLogEdit,nullptr,8,40,rc.right-16,rc.bottom-48,SWP_NOZORDER);
-                InvalidateRect(g_hLogEdit, nullptr, TRUE);
-                UpdateWindow(g_hLogEdit);
+                SetWindowPos(g_hLogList,nullptr,8,40,rc.right-16,rc.bottom-48,SWP_NOZORDER);
+                AdjustLogColumns();
+                InvalidateRect(g_hLogList, nullptr, TRUE);
                 return 0; }
             case WM_COMMAND: {
                 UINT id=LOWORD(w);
@@ -2191,4 +2223,16 @@ static std::wstring MakeProjectRelativePath(const std::wstring& abs) {
     std::filesystem::path rel = std::filesystem::relative(p, root, ec);
     if (!ec) return rel.wstring();
     return p.filename().wstring();
+}
+
+static void AdjustLogColumns() {
+    if (!g_hLogList || !IsWindow(g_hLogList)) return;
+    // Autosize to header, then content; keep Remarks wider
+    for (int i=0;i<7;++i) ListView_SetColumnWidth(g_hLogList, i, LVSCW_AUTOSIZE_USEHEADER);
+    ListView_SetColumnWidth(g_hLogList, 7, LVSCW_AUTOSIZE_USEHEADER);
+    // Add extra padding for readability
+    for (int i=0;i<8;++i) {
+        int w = ListView_GetColumnWidth(g_hLogList, i);
+        ListView_SetColumnWidth(g_hLogList, i, w + 12);
+    }
 }
