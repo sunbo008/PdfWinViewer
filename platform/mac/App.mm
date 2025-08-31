@@ -1118,6 +1118,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 - (void)createInspectorPanel;
 - (void)toggleInspectorVisibility:(id)sender;
 - (void)setInspectorVisible:(BOOL)visible animated:(BOOL)animated;
+- (void)updateInspectorLayout;
 - (void)updateInspectorContent;
 @end
 
@@ -1861,6 +1862,12 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     if (self.bookmarkVisible && self.expandedTopControlBar) {
         NSLog(@"[ScrollDebug] 由于分割视图变化，更新展开状态控制栏布局");
         [self updateExpandedControlBarLayout];
+    }
+    
+    // 更新检查器布局以适应新的窗口大小
+    if (self.inspectorVisible) {
+        NSLog(@"[Inspector] 由于分割视图变化，更新检查器布局");
+        [self updateInspectorLayout];
     }
     
     NSLog(@"[ScrollDebug] ========== 分割视图尺寸改变处理完成 ==========");
@@ -2745,6 +2752,19 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.inspectorTextView.textColor = [NSColor labelColor];
     self.inspectorTextView.backgroundColor = [NSColor textBackgroundColor];
     
+    // 设置自动换行和文本容器属性
+    self.inspectorTextView.textContainer.containerSize = NSMakeSize(textFrame.size.width, CGFLOAT_MAX);
+    self.inspectorTextView.textContainer.widthTracksTextView = YES;
+    self.inspectorTextView.textContainer.heightTracksTextView = NO;
+    self.inspectorTextView.textContainer.lineBreakMode = NSLineBreakByWordWrapping;
+    
+    // 设置文本视图的自动调整行为
+    self.inspectorTextView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.inspectorTextView.horizontallyResizable = NO;  // 禁用水平调整
+    self.inspectorTextView.verticallyResizable = YES;   // 启用垂直调整
+    
+    NSLog(@"[Inspector] 文本视图自动换行配置完成，容器宽度: %.1f", textFrame.size.width);
+    
     // 创建滚动视图
     self.inspectorScrollView = [[NSScrollView alloc] initWithFrame:textFrame];
     self.inspectorScrollView.documentView = self.inspectorTextView;
@@ -2787,15 +2807,30 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
         } completionHandler:^{
             NSLog(@"[Inspector] 检查器切换动画完成");
             if (visible) {
+                [self updateInspectorLayout];
                 [self updateInspectorContent];
             }
         }];
     } else {
         [rightSplit setPosition:newPosition ofDividerAtIndex:0];
         if (visible) {
+            [self updateInspectorLayout];
             [self updateInspectorContent];
         }
     }
+}
+
+- (void)updateInspectorLayout {
+    if (!self.inspectorVisible || !self.inspectorTextView) return;
+    
+    // 更新文本容器大小以适应窗口变化
+    NSRect currentFrame = self.inspectorScrollView.frame;
+    CGFloat newWidth = currentFrame.size.width - 20; // 减去滚动条和边距
+    
+    self.inspectorTextView.textContainer.containerSize = NSMakeSize(newWidth, CGFLOAT_MAX);
+    [self.inspectorTextView setNeedsDisplay:YES];
+    
+    NSLog(@"[Inspector] 文本容器宽度已更新为: %.1f", newWidth);
 }
 
 - (void)updateInspectorContent {
@@ -2835,48 +2870,120 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [info appendFormat:@"页面对象列表\n"];
     [info appendFormat:@"================\n"];
     
-    // 遍历页面对象
+    // 遍历页面对象，按PDF标准格式显示
     for (int i = 0; i < objectCount; i++) {
         FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
         if (!obj) continue;
         
+        // 获取对象类型
         int objType = FPDFPageObj_GetType(obj);
-        NSString* typeName = @"未知";
         
+        // 模拟对象号（使用页面内索引+基础偏移）
+        int objectNumber = i + 10; // 假设页面对象从10开始编号
+        int generationNumber = 0;   // 通常为0
+        
+        [info appendFormat:@"%d %d obj\n", objectNumber, generationNumber];
+        [info appendFormat:@"<<\n"];
+        
+        // 根据对象类型添加相应的字典内容
         switch (objType) {
-            case FPDF_PAGEOBJ_TEXT:
-                typeName = @"文本";
+            case FPDF_PAGEOBJ_TEXT: {
+                [info appendFormat:@"  /Type /Text\n"];
+                
+                // 获取对象边界框
+                float left, bottom, right, top;
+                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
+                }
+                
+                // 尝试获取文本颜色
+                unsigned int R, G, B, A;
+                if (FPDFPageObj_GetFillColor(obj, &R, &G, &B, &A)) {
+                    [info appendFormat:@"  /FillColor [%d %d %d]\n", R, G, B];
+                }
+                
+                // 获取变换矩阵
+                FS_MATRIX matrix;
+                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
+                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
+                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
+                }
+                
+                [info appendFormat:@"  /Subtype /Text\n"];
                 break;
-            case FPDF_PAGEOBJ_PATH:
-                typeName = @"路径";
+            }
+            case FPDF_PAGEOBJ_PATH: {
+                [info appendFormat:@"  /Type /Path\n"];
+                
+                float left, bottom, right, top;
+                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
+                }
+                
+                // 获取填充颜色
+                unsigned int R, G, B, A;
+                if (FPDFPageObj_GetFillColor(obj, &R, &G, &B, &A)) {
+                    [info appendFormat:@"  /FillColor [%d %d %d]\n", R, G, B];
+                }
+                
+                // 获取描边颜色
+                if (FPDFPageObj_GetStrokeColor(obj, &R, &G, &B, &A)) {
+                    [info appendFormat:@"  /StrokeColor [%d %d %d]\n", R, G, B];
+                }
+                
+                // 获取变换矩阵
+                FS_MATRIX matrix;
+                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
+                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
+                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
+                }
                 break;
-            case FPDF_PAGEOBJ_IMAGE:
-                typeName = @"图像";
+            }
+            case FPDF_PAGEOBJ_IMAGE: {
+                [info appendFormat:@"  /Type /XObject\n"];
+                [info appendFormat:@"  /Subtype /Image\n"];
+                
+                float left, bottom, right, top;
+                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
+                }
+                
+                // 获取变换矩阵
+                FS_MATRIX matrix;
+                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
+                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
+                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
+                }
                 break;
-            case FPDF_PAGEOBJ_SHADING:
-                typeName = @"渐变";
+            }
+            case FPDF_PAGEOBJ_SHADING: {
+                [info appendFormat:@"  /Type /Shading\n"];
+                
+                float left, bottom, right, top;
+                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
+                }
                 break;
-            case FPDF_PAGEOBJ_FORM:
-                typeName = @"表单";
+            }
+            case FPDF_PAGEOBJ_FORM: {
+                [info appendFormat:@"  /Type /XObject\n"];
+                [info appendFormat:@"  /Subtype /Form\n"];
+                
+                float left, bottom, right, top;
+                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
+                }
                 break;
-            default:
-                typeName = [NSString stringWithFormat:@"类型%d", objType];
+            }
+            default: {
+                [info appendFormat:@"  /Type /Unknown\n"];
+                [info appendFormat:@"  /ObjectType %d\n", objType];
                 break;
+            }
         }
         
-        // 获取对象边界框
-        float left, bottom, right, top;
-        if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-            [info appendFormat:@"%@ (%.1f,%.1f,%.1f,%.1f)\n", 
-                typeName, left, bottom, right, top];
-        } else {
-            [info appendFormat:@"%@\n", typeName];
-        }
-        
-        // 如果是文本对象，添加标记（暂时不提取文本内容，因为需要FPDF_TEXTPAGE）
-        if (objType == FPDF_PAGEOBJ_TEXT) {
-            [info appendFormat:@"   [文本对象]\n"];
-        }
+        [info appendFormat:@">>\n"];
+        [info appendFormat:@"endobj\n\n"];
     }
     
     FPDF_ClosePage(page);
