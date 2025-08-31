@@ -2867,10 +2867,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
         // 获取对象边界框
         float left, bottom, right, top;
         if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-            [info appendFormat:@"%d. %@ (%.1f,%.1f,%.1f,%.1f)\n", 
-                i + 1, typeName, left, bottom, right, top];
+            [info appendFormat:@"%@ (%.1f,%.1f,%.1f,%.1f)\n", 
+                typeName, left, bottom, right, top];
         } else {
-            [info appendFormat:@"%d. %@\n", i + 1, typeName];
+            [info appendFormat:@"%@\n", typeName];
         }
         
         // 如果是文本对象，添加标记（暂时不提取文本内容，因为需要FPDF_TEXTPAGE）
