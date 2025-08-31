@@ -291,10 +291,18 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     return std::string([s UTF8String] ?: "");
 }
 
+// PdfView的委托协议
+@protocol PdfViewDelegate <NSObject>
+@optional
+- (void)pdfViewDidChangePage:(id)sender;
+@end
+
 @interface PdfView : NSView
+@property (nonatomic, assign) id<PdfViewDelegate> delegate;
 - (BOOL)openPDFAtPath:(NSString*)path;
 - (FPDF_DOCUMENT)document;
 - (void)goToPage:(int)index;
+- (int)currentPageIndex; // 获取当前页索引（0开始）
 - (NSSize)currentPageSizePt; // 当前页 PDF 尺寸（pt）
 - (void)updateViewSizeToFitPage; // 根据页尺寸与缩放调整自身 frame 大小（供滚动容器使用）
 @end
@@ -333,7 +341,22 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 }
 
 - (FPDF_DOCUMENT)document { return _doc; }
-- (void)goToPage:(int)index { if (!_doc) return; int pc = FPDF_GetPageCount(_doc); if (pc>0){ if (index<0) index=0; if(index>=pc) index=pc-1; _pageIndex=index; [self setNeedsDisplay:YES]; } }
+- (int)currentPageIndex { return _pageIndex; }
+- (void)goToPage:(int)index { 
+    if (!_doc) return; 
+    int pc = FPDF_GetPageCount(_doc); 
+    if (pc>0){ 
+        if (index<0) index=0; 
+        if(index>=pc) index=pc-1; 
+        int oldIndex = _pageIndex;
+        _pageIndex=index; 
+        [self setNeedsDisplay:YES]; 
+        // 如果页面真的发生了变化，通知delegate
+        if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+            [self.delegate pdfViewDidChangePage:self];
+        }
+    } 
+}
 
 - (instancetype)initWithFrame:(NSRect)frame {
     if (self = [super initWithFrame:frame]) {
@@ -404,6 +427,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
             return;
         }
     }
+    int oldIndex = _pageIndex;
     switch (c) {
         case NSHomeFunctionKey: _pageIndex = 0; break;
         case NSEndFunctionKey: {
@@ -416,6 +440,10 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
         default: break;
     }
     [self setNeedsDisplay:YES];
+    // 如果页面发生了变化，通知delegate
+    if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+        [self.delegate pdfViewDidChangePage:self];
+    }
 }
 
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -426,10 +454,54 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 - (IBAction)zoomIn:(id)sender { _zoom = std::min(8.0, _zoom * 1.1); [self updateViewSizeToFitPage]; [self setNeedsDisplay:YES]; }
 - (IBAction)zoomOut:(id)sender { _zoom = std::max(0.1, _zoom / 1.1); [self updateViewSizeToFitPage]; [self setNeedsDisplay:YES]; }
 - (IBAction)zoomActual:(id)sender { _zoom = 1.0; [self updateViewSizeToFitPage]; [self setNeedsDisplay:YES]; }
-- (IBAction)goHome:(id)sender { if (_doc){ _pageIndex = 0; [self setNeedsDisplay:YES]; } }
-- (IBAction)goEnd:(id)sender { if (_doc){ int pc = FPDF_GetPageCount(_doc); if (pc>0) _pageIndex = pc-1; [self setNeedsDisplay:YES]; } }
-- (IBAction)goPrevPage:(id)sender { if (_doc){ if (_pageIndex>0) _pageIndex--; [self setNeedsDisplay:YES]; } }
-- (IBAction)goNextPage:(id)sender { if (_doc){ int pc = FPDF_GetPageCount(_doc); if (pc>0 && _pageIndex<pc-1) _pageIndex++; [self setNeedsDisplay:YES]; } }
+- (IBAction)goHome:(id)sender { 
+    if (_doc){ 
+        int oldIndex = _pageIndex;
+        _pageIndex = 0; 
+        [self setNeedsDisplay:YES]; 
+        if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+            [self.delegate pdfViewDidChangePage:self];
+        }
+    } 
+}
+- (IBAction)goEnd:(id)sender { 
+    if (_doc){ 
+        int pc = FPDF_GetPageCount(_doc); 
+        if (pc>0) {
+            int oldIndex = _pageIndex;
+            _pageIndex = pc-1; 
+            [self setNeedsDisplay:YES]; 
+            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+                [self.delegate pdfViewDidChangePage:self];
+            }
+        }
+    } 
+}
+- (IBAction)goPrevPage:(id)sender { 
+    if (_doc){ 
+        if (_pageIndex>0) {
+            int oldIndex = _pageIndex;
+            _pageIndex--; 
+            [self setNeedsDisplay:YES]; 
+            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+                [self.delegate pdfViewDidChangePage:self];
+            }
+        }
+    } 
+}
+- (IBAction)goNextPage:(id)sender { 
+    if (_doc){ 
+        int pc = FPDF_GetPageCount(_doc); 
+        if (pc>0 && _pageIndex<pc-1) {
+            int oldIndex = _pageIndex;
+            _pageIndex++; 
+            [self setNeedsDisplay:YES]; 
+            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+                [self.delegate pdfViewDidChangePage:self];
+            }
+        }
+    } 
+}
 - (IBAction)gotoPage:(id)sender { [self promptGotoPage]; }
 - (IBAction)exportPNG:(id)sender { [self exportCurrentPagePNG]; }
 
@@ -468,7 +540,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, buffer.data(), (size_t)buffer.size(), NULL);
-        CGBitmapInfo bi = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst; // BGRA
+        CGBitmapInfo bi = (CGBitmapInfo)((uint32_t)kCGBitmapByteOrder32Little | (uint32_t)kCGImageAlphaPremultipliedFirst); // BGRA
         CGImageRef img = CGImageCreate(pxW, pxH, 8, 32, pxW * 4, cs, bi, dp, NULL, false, kCGRenderingIntentDefault);
         // 以点（pt）为单位的目标绘制尺寸，并对齐到像素边界
         double destWpt = wpt * _zoom;
@@ -726,7 +798,14 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     [alert addButtonWithTitle:@"OK"]; [alert addButtonWithTitle:@"Cancel"];
     if ([alert runModal] == NSAlertFirstButtonReturn) {
         NSInteger v = tf.integerValue;
-        if (v >= 1 && v <= pc) { _pageIndex = (int)v - 1; [self setNeedsDisplay:YES]; }
+        if (v >= 1 && v <= pc) { 
+            int oldIndex = _pageIndex;
+            _pageIndex = (int)v - 1; 
+            [self setNeedsDisplay:YES]; 
+            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+                [self.delegate pdfViewDidChangePage:self];
+            }
+        }
     }
 }
 
@@ -831,11 +910,11 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     
     if (pdfFormat == FPDFBitmap_BGRA) {
         // BGRA 格式
-        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        bi = (CGBitmapInfo)((uint32_t)kCGBitmapByteOrder32Little | (uint32_t)kCGImageAlphaPremultipliedFirst);
         dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
     } else if (pdfFormat == FPDFBitmap_BGRx) {
         // BGRx 格式（无 alpha）
-        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+        bi = (CGBitmapInfo)((uint32_t)kCGBitmapByteOrder32Little | (uint32_t)kCGImageAlphaNoneSkipFirst);
         dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
     } else if (pdfFormat == FPDFBitmap_BGR) {
         // BGR 24位格式需要特殊处理，转换为 RGB 格式
@@ -865,7 +944,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
         MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] BGR converted to RGB, new stride=%d", finalStride]);
     } else {
         // 默认使用 BGRA
-        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        bi = (CGBitmapInfo)((uint32_t)kCGBitmapByteOrder32Little | (uint32_t)kCGImageAlphaPremultipliedFirst);
         dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
     }
     
@@ -952,7 +1031,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     return root;
 }
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, PdfViewDelegate>
 @property (nonatomic, strong) NSWindow* window;
 @property (nonatomic, strong) NSSplitView* split;
 @property (nonatomic, strong) NSOutlineView* outline;
@@ -963,15 +1042,47 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 @property (nonatomic, strong) NSMenu* recentMenu;
 @property (nonatomic, strong) NSMenuItem* recentMenuItem;
 @property (nonatomic, strong) NSMutableDictionary* settingsDict; // 与 Windows 对齐的 settings.json 容器
+
+// 底部状态栏相关属性
+@property (nonatomic, strong) NSView* statusBar;
+@property (nonatomic, strong) NSTextField* pageLabel;
+@property (nonatomic, strong) NSTextField* pageInput;
+@property (nonatomic, strong) NSTextField* totalPagesLabel;
+@property (nonatomic, strong) NSButton* prevPageButton;
+@property (nonatomic, strong) NSButton* nextPageButton;
+@property (nonatomic, strong) NSView* mainContentView; // 主内容区域（不包括状态栏）
+
+// 书签控制栏相关属性
+@property (nonatomic, strong) NSView* bookmarkControlBar;
+@property (nonatomic, strong) NSButton* bookmarkToggleButton;
+@property (nonatomic, strong) NSView* leftPanel; // 左侧面板（包含控制栏和书签）
+@property (nonatomic, assign) BOOL bookmarkVisible; // 书签是否可见
+@property (nonatomic, strong) NSView* expandedTopControlBar; // 展开状态的顶部控制栏
 @end
 
-// 为在主实现中调用分类方法提供前置声明（命名分类，避免“primary class”重复实现告警）
+// 为在主实现中调用分类方法提供前置声明（命名分类，避免"primary class"重复实现告警）
 @interface AppDelegate (ForwardDecls)
 - (void)loadSettingsJSON;
 - (void)extractRecentFromSettings;
 - (void)rebuildRecentMenu;
 - (void)persistRecentIntoSettings;
 - (void)openPathAndAdjust:(NSString*)path;
+- (void)createStatusBar;
+- (void)updateStatusBar;
+- (void)onPrevPage:(id)sender;
+- (void)onNextPage:(id)sender;
+- (void)onPageInputChanged:(id)sender;
+- (void)createBookmarkControlBar;
+- (void)toggleBookmarkVisibility:(id)sender;
+- (void)setBookmarkVisible:(BOOL)visible animated:(BOOL)animated;
+- (void)expandAllBookmarks:(id)sender;
+- (void)collapseAllBookmarks:(id)sender;
+- (void)highlightCurrentBookmark;
+- (TocNode*)findBookmarkForPage:(int)pageIndex inNode:(TocNode*)node;
+- (void)expandParentsOfItem:(TocNode*)item;
+- (BOOL)findParentPathForItem:(TocNode*)targetItem inNode:(TocNode*)currentNode parentPath:(NSMutableArray*)path;
+- (void)createExpandedBookmarkControls;
+- (void)removeExpandedBookmarkControls;
 @end
 
 @implementation AppDelegate
@@ -985,17 +1096,44 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
                                               styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                                 backing:NSBackingStoreBuffered defer:NO];
 
-    // 左侧书签，右侧渲染
-    self.split = [[NSSplitView alloc] initWithFrame:self.window.contentView.bounds];
+    // 创建主容器视图，包含主内容区域和底部状态栏
+    NSView* containerView = [[NSView alloc] initWithFrame:self.window.contentView.bounds];
+    containerView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    
+    // 创建主内容区域（占据除状态栏外的所有空间）
+    self.mainContentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 30, rect.size.width, rect.size.height - 30)];
+    self.mainContentView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [containerView addSubview:self.mainContentView];
+    
+    // 创建状态栏（高度30px，放在底部）
+    [self createStatusBar];
+    self.statusBar.frame = NSMakeRect(0, 0, rect.size.width, 30);
+    self.statusBar.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [containerView addSubview:self.statusBar];
+    NSLog(@"[StatusBar] 状态栏已添加到容器视图，frame: %@", NSStringFromRect(self.statusBar.frame));
+
+    // 初始化书签可见性状态（默认收起）
+    self.bookmarkVisible = NO;
+    
+    // 左侧书签，右侧渲染（在主内容区域内）
+    self.split = [[NSSplitView alloc] initWithFrame:self.mainContentView.bounds];
     self.split.dividerStyle = NSSplitViewDividerStyleThin;
     self.split.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [self.split setVertical:YES]; // 左右分栏：左侧书签，右侧内容
 
-    NSView* left = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 260, rect.size.height)];
-    NSView* right = [[NSView alloc] initWithFrame:NSMakeRect(260, 0, rect.size.width-260, rect.size.height)];
+    // 创建左侧面板（包含顶部控制栏和书签区域）
+    CGFloat collapsedWidth = 20; // 收起状态只显示三角形按钮的宽度
+    CGFloat expandedWidth = 260; // 展开状态的完整宽度
+    CGFloat initialWidth = collapsedWidth; // 默认收起状态
+    self.leftPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, initialWidth, self.mainContentView.bounds.size.height)];
+    NSView* right = [[NSView alloc] initWithFrame:NSMakeRect(initialWidth, 0, self.mainContentView.bounds.size.width-initialWidth, self.mainContentView.bounds.size.height)];
 
-    // Outline
-    self.outline = [[NSOutlineView alloc] initWithFrame:left.bounds];
+    // 创建书签控制栏（顶部水平布局）
+    [self createBookmarkControlBar];
+    
+    // Outline（书签区域，位于控制栏下方，初始时隐藏）
+    NSRect outlineFrame = NSMakeRect(0, 0, 260, self.leftPanel.bounds.size.height - 30); // 控制栏下方，高度减去控制栏高度
+    self.outline = [[NSOutlineView alloc] initWithFrame:outlineFrame];
     NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:@"toc"];
     col.title = @"书签";
     [self.outline addTableColumn:col];
@@ -1006,13 +1144,15 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.outline.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.outline.rowSizeStyle = NSTableViewRowSizeStyleDefault;
 
-    self.outlineScroll = [[NSScrollView alloc] initWithFrame:left.bounds];
+    self.outlineScroll = [[NSScrollView alloc] initWithFrame:outlineFrame];
     self.outlineScroll.documentView = self.outline;
     self.outlineScroll.hasVerticalScroller = YES;
     self.outlineScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [left addSubview:self.outlineScroll];
+    self.outlineScroll.hidden = YES; // 默认隐藏
+    [self.leftPanel addSubview:self.outlineScroll];
 
     self.view = [[PdfView alloc] initWithFrame:NSMakeRect(0,0,800,600)];
+    self.view.delegate = self;
     NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:right.bounds];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
@@ -1021,10 +1161,15 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     scroll.documentView = self.view;
     [right addSubview:scroll];
 
-    [self.split addSubview:left];
+    [self.split addSubview:self.leftPanel];
     [self.split addSubview:right];
-    [self.split setPosition:260 ofDividerAtIndex:0];
-    self.window.contentView = self.split;
+    [self.split setPosition:initialWidth ofDividerAtIndex:0]; // 默认只显示控制栏宽度
+    [self.mainContentView addSubview:self.split];
+    
+    // 设置容器视图为窗口的内容视图
+    self.window.contentView = containerView;
+    NSLog(@"[StatusBar] 容器视图设置为窗口内容视图，容器frame: %@", NSStringFromRect(containerView.frame));
+    NSLog(@"[StatusBar] 窗口contentView: %@", self.window.contentView);
     [self.window setTitle:@"PdfWinViewer (macOS)"];
     [self.window makeKeyAndOrderFront:nil];
 
@@ -1131,7 +1276,9 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     if (!doc) { self.tocRoot = nil; [self.outline reloadData]; return; }
     self.tocRoot = BuildBookmarksTree(doc);
     [self.outline reloadData];
-    [self.outline expandItem:nil expandChildren:YES];
+    // 默认折叠所有顶层书签
+    [self.outline collapseItem:nil collapseChildren:YES];
+    NSLog(@"[BookmarkControl] 书签重建完成，默认折叠所有顶层书签");
 }
 
 // DataSource
@@ -1270,8 +1417,18 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     if (path.length == 0) return;
     NSLog(@"[PdfWinViewer] openPathAndAdjust: %@", path);
     if ([self.view openPDFAtPath:path]) {
+        NSLog(@"[StatusBar] PDF文件打开成功，准备更新状态栏");
         [self rebuildToc];
         [self.window makeFirstResponder:self.view];
+        // 更新状态栏显示（确保状态栏已初始化）
+        if (self.statusBar) {
+            [self updateStatusBar];
+        } else {
+            NSLog(@"[StatusBar] 状态栏尚未初始化，跳过更新");
+        }
+        
+        // 高亮当前书签
+        [self highlightCurrentBookmark];
         // 根据文档页尺寸调整窗口适配（保持在屏幕可视范围内）
         NSSize s = [self.view currentPageSizePt];
         CGFloat newW = MIN(MAX(800, s.width + 300), 1600);   // 预留左栏与边距
@@ -1365,6 +1522,526 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self.recentPaths removeAllObjects];
     [self persistRecentIntoSettings];
     [self rebuildRecentMenu];
+}
+
+#pragma mark - 状态栏相关方法
+
+- (void)createStatusBar {
+    NSLog(@"[StatusBar] 开始创建状态栏");
+    // 创建状态栏容器
+    self.statusBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 800, 30)];
+    self.statusBar.wantsLayer = YES;
+    // 使用macOS原生的窗口背景色
+    self.statusBar.layer.backgroundColor = [[NSColor windowBackgroundColor] CGColor];
+    // 添加顶部分隔线
+    self.statusBar.layer.borderWidth = 0.5;
+    self.statusBar.layer.borderColor = [[NSColor separatorColor] CGColor];
+    NSLog(@"[StatusBar] 状态栏容器创建完成，frame: %@", NSStringFromRect(self.statusBar.frame));
+    
+    // 添加分隔线
+    NSView* separator = [[NSView alloc] initWithFrame:NSMakeRect(0, 29, 800, 1)];
+    separator.wantsLayer = YES;
+    separator.layer.backgroundColor = [[NSColor separatorColor] CGColor];
+    separator.autoresizingMask = NSViewWidthSizable;
+    [self.statusBar addSubview:separator];
+    
+    // 页码标签 "页码:"
+    self.pageLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(10, 7, 40, 16)];
+    self.pageLabel.stringValue = @"页码:";
+    self.pageLabel.bezeled = NO;
+    self.pageLabel.drawsBackground = NO;
+    self.pageLabel.editable = NO;
+    self.pageLabel.selectable = NO;
+    self.pageLabel.font = [NSFont systemFontOfSize:12];
+    self.pageLabel.textColor = [NSColor labelColor];
+    [self.statusBar addSubview:self.pageLabel];
+    
+    // 页码输入框
+    self.pageInput = [[NSTextField alloc] initWithFrame:NSMakeRect(55, 6, 50, 18)];
+    self.pageInput.stringValue = @"1";
+    self.pageInput.font = [NSFont systemFontOfSize:12];
+    self.pageInput.alignment = NSTextAlignmentCenter;
+    self.pageInput.target = self;
+    self.pageInput.action = @selector(onPageInputChanged:);
+    [self.statusBar addSubview:self.pageInput];
+    
+    // 总页数标签
+    self.totalPagesLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(110, 7, 60, 16)];
+    self.totalPagesLabel.stringValue = @"/ 0";
+    self.totalPagesLabel.bezeled = NO;
+    self.totalPagesLabel.drawsBackground = NO;
+    self.totalPagesLabel.editable = NO;
+    self.totalPagesLabel.selectable = NO;
+    self.totalPagesLabel.font = [NSFont systemFontOfSize:12];
+    self.totalPagesLabel.textColor = [NSColor labelColor];
+    [self.statusBar addSubview:self.totalPagesLabel];
+    
+    // 上一页按钮
+    self.prevPageButton = [NSButton buttonWithTitle:@"上一页" target:self action:@selector(onPrevPage:)];
+    self.prevPageButton.frame = NSMakeRect(180, 4, 60, 22);
+    self.prevPageButton.font = [NSFont systemFontOfSize:11];
+    self.prevPageButton.bezelStyle = NSBezelStyleRounded;
+    self.prevPageButton.enabled = NO;
+    [self.statusBar addSubview:self.prevPageButton];
+    
+    // 下一页按钮
+    self.nextPageButton = [NSButton buttonWithTitle:@"下一页" target:self action:@selector(onNextPage:)];
+    self.nextPageButton.frame = NSMakeRect(250, 4, 60, 22);
+    self.nextPageButton.font = [NSFont systemFontOfSize:11];
+    self.nextPageButton.bezelStyle = NSBezelStyleRounded;
+    self.nextPageButton.enabled = NO;
+    [self.statusBar addSubview:self.nextPageButton];
+    
+    NSLog(@"[StatusBar] 状态栏创建完成，所有子视图已添加");
+}
+
+#pragma mark - 书签控制栏相关方法
+
+- (void)createBookmarkControlBar {
+    NSLog(@"[BookmarkControl] 开始创建书签控制栏");
+    
+    // 创建控制栏容器（只在收起状态下可见，固定宽度20px）
+    CGFloat collapsedWidth = 20;
+    self.bookmarkControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, collapsedWidth, self.leftPanel.bounds.size.height)];
+    self.bookmarkControlBar.wantsLayer = YES;
+    self.bookmarkControlBar.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
+    self.bookmarkControlBar.autoresizingMask = NSViewHeightSizable; // 只允许高度自适应，宽度固定
+    
+    // 创建展开/收起按钮（垂直居中，水平居中）
+    CGFloat buttonWidth = 16;
+    CGFloat buttonHeight = 16;
+    CGFloat xCenter = (self.bookmarkControlBar.bounds.size.width - buttonWidth) / 2;
+    CGFloat yCenter = (self.bookmarkControlBar.bounds.size.height - buttonHeight) / 2;
+    self.bookmarkToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(xCenter, yCenter, buttonWidth, buttonHeight)];
+    self.bookmarkToggleButton.title = @"▶"; // 右箭头表示可以展开
+    self.bookmarkToggleButton.font = [NSFont systemFontOfSize:10];
+    self.bookmarkToggleButton.bordered = NO;
+    self.bookmarkToggleButton.target = self;
+    self.bookmarkToggleButton.action = @selector(toggleBookmarkVisibility:);
+    [self.bookmarkControlBar addSubview:self.bookmarkToggleButton];
+    
+    [self.leftPanel addSubview:self.bookmarkControlBar];
+    
+    NSLog(@"[BookmarkControl] 书签控制栏创建完成");
+}
+
+- (void)toggleBookmarkVisibility:(id)sender {
+    NSLog(@"[BookmarkControl] 切换书签可见性，当前状态: %@", self.bookmarkVisible ? @"可见" : @"隐藏");
+    [self setBookmarkVisible:!self.bookmarkVisible animated:YES];
+}
+
+- (void)setBookmarkVisible:(BOOL)visible animated:(BOOL)animated {
+    if (self.bookmarkVisible == visible) return; // 状态未改变
+    
+    self.bookmarkVisible = visible;
+    NSLog(@"[BookmarkControl] 设置书签可见性: %@", visible ? @"显示" : @"隐藏");
+    
+    // 计算新的宽度
+    CGFloat collapsedWidth = 20;
+    CGFloat expandedWidth = 260;
+    CGFloat newWidth = visible ? expandedWidth : collapsedWidth;
+    
+    if (animated) {
+        // 如果要展开，先创建展开状态的控件
+        if (visible) {
+            [self createExpandedBookmarkControls];
+        }
+        
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+            context.duration = 0.25; // 动画持续时间
+            context.allowsImplicitAnimation = YES;
+            
+            // 调整左侧面板宽度
+            NSRect leftFrame = self.leftPanel.frame;
+            leftFrame.size.width = newWidth;
+            self.leftPanel.animator.frame = leftFrame;
+            
+            // 调整分割视图位置
+            [self.split.animator setPosition:newWidth ofDividerAtIndex:0];
+            
+        } completionHandler:^{
+            // 动画完成后的处理
+            if (!visible) {
+                // 收起完成，移除展开状态的控件
+                [self removeExpandedBookmarkControls];
+            } else {
+                // 展开完成，确保expandedTopControlBar的宽度正确
+                if (self.expandedTopControlBar) {
+                    NSRect frame = self.expandedTopControlBar.frame;
+                    frame.size.width = newWidth;
+                    self.expandedTopControlBar.frame = frame;
+                    
+                    // 同时调整◀按钮的位置到新的右侧边缘
+                    for (NSView* subview in self.expandedTopControlBar.subviews) {
+                        if ([subview isKindOfClass:[NSButton class]]) {
+                            NSButton* button = (NSButton*)subview;
+                            if ([button.title isEqualToString:@"◀"]) {
+                                NSRect buttonFrame = button.frame;
+                                buttonFrame.origin.x = newWidth - buttonFrame.size.width - 4; // 4px右边距
+                                button.frame = buttonFrame;
+                                NSLog(@"[BookmarkControl] 动画完成后调整◀按钮位置: %@", NSStringFromRect(buttonFrame));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            NSLog(@"[BookmarkControl] 书签切换动画完成");
+        }];
+    } else {
+        // 立即切换
+        NSRect leftFrame = self.leftPanel.frame;
+        leftFrame.size.width = newWidth;
+        self.leftPanel.frame = leftFrame;
+        
+        [self.split setPosition:newWidth ofDividerAtIndex:0];
+        
+        if (visible) {
+            [self createExpandedBookmarkControls];
+            // 立即调整expandedTopControlBar的宽度
+            if (self.expandedTopControlBar) {
+                NSRect frame = self.expandedTopControlBar.frame;
+                frame.size.width = newWidth;
+                self.expandedTopControlBar.frame = frame;
+                
+                // 同时调整◀按钮的位置到新的右侧边缘
+                for (NSView* subview in self.expandedTopControlBar.subviews) {
+                    if ([subview isKindOfClass:[NSButton class]]) {
+                        NSButton* button = (NSButton*)subview;
+                        if ([button.title isEqualToString:@"◀"]) {
+                            NSRect buttonFrame = button.frame;
+                            buttonFrame.origin.x = newWidth - buttonFrame.size.width - 4; // 4px右边距
+                            button.frame = buttonFrame;
+                            NSLog(@"[BookmarkControl] 立即切换时调整◀按钮位置: %@", NSStringFromRect(buttonFrame));
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            [self removeExpandedBookmarkControls];
+        }
+    }
+}
+
+- (void)expandAllBookmarks:(id)sender {
+    NSLog(@"[BookmarkControl] 展开所有书签");
+    [self.outline expandItem:nil expandChildren:YES];
+}
+
+- (void)collapseAllBookmarks:(id)sender {
+    NSLog(@"[BookmarkControl] 折叠所有书签");
+    [self.outline collapseItem:nil collapseChildren:YES];
+}
+
+- (TocNode*)findBookmarkForPage:(int)pageIndex inNode:(TocNode*)node {
+    if (!node) return nil;
+    
+    NSLog(@"[BookmarkSearch] 搜索页面 %d，检查节点: %@ (页面: %d)", pageIndex, node.title, node.pageIndex);
+    
+    // 检查当前节点是否精确匹配
+    if (node.pageIndex == pageIndex) {
+        NSLog(@"[BookmarkSearch] 找到精确匹配: %@", node.title);
+        return node;
+    }
+    
+    // 查找最接近的书签（页面索引小于等于当前页面的最大值）
+    TocNode* bestMatch = nil;
+    if (node.pageIndex >= 0 && node.pageIndex <= pageIndex) {
+        bestMatch = node;
+        NSLog(@"[BookmarkSearch] 当前最佳匹配: %@ (页面: %d)", bestMatch.title, bestMatch.pageIndex);
+    }
+    
+    // 递归搜索子节点
+    for (TocNode* child in node.children) {
+        TocNode* childMatch = [self findBookmarkForPage:pageIndex inNode:child];
+        if (childMatch) {
+            // 如果找到精确匹配，直接返回
+            if (childMatch.pageIndex == pageIndex) {
+                NSLog(@"[BookmarkSearch] 子节点中找到精确匹配: %@", childMatch.title);
+                return childMatch;
+            }
+            // 否则选择页面索引更接近的那个
+            if (!bestMatch || childMatch.pageIndex > bestMatch.pageIndex) {
+                bestMatch = childMatch;
+                NSLog(@"[BookmarkSearch] 更新最佳匹配: %@ (页面: %d)", bestMatch.title, bestMatch.pageIndex);
+            }
+        }
+    }
+    
+    return bestMatch;
+}
+
+- (void)highlightCurrentBookmark {
+    if (!self.tocRoot || !self.view) {
+        NSLog(@"[BookmarkHighlight] tocRoot或view为空，跳过高亮");
+        return;
+    }
+    
+    int currentPage = [self.view currentPageIndex];
+    NSLog(@"[BookmarkHighlight] 当前页面: %d", currentPage);
+    
+    // 查找对应的书签
+    TocNode* targetBookmark = [self findBookmarkForPage:currentPage inNode:self.tocRoot];
+    if (targetBookmark) {
+        NSLog(@"[BookmarkHighlight] 找到匹配书签: %@ (页面 %d)", targetBookmark.title, targetBookmark.pageIndex);
+        
+        // 确保书签的父节点都是展开的，这样才能看到目标书签
+        [self expandParentsOfItem:targetBookmark];
+        
+        // 在outline view中选中该书签
+        NSInteger row = [self.outline rowForItem:targetBookmark];
+        if (row >= 0) {
+            [self.outline selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];
+            [self.outline scrollRowToVisible:row];
+            NSLog(@"[BookmarkHighlight] 书签已高亮，行号: %ld", (long)row);
+        } else {
+            NSLog(@"[BookmarkHighlight] 无法找到书签对应的行，可能书签被折叠了");
+        }
+    } else {
+        NSLog(@"[BookmarkHighlight] 未找到匹配的书签");
+        // 清除选择
+        [self.outline deselectAll:nil];
+    }
+}
+
+- (void)expandParentsOfItem:(TocNode*)item {
+    if (!item || !self.tocRoot) return;
+    
+    // 查找item的父节点路径
+    NSMutableArray* parentPath = [NSMutableArray array];
+    [self findParentPathForItem:item inNode:self.tocRoot parentPath:parentPath];
+    
+    // 展开所有父节点
+    for (TocNode* parent in parentPath) {
+        if (parent != self.tocRoot) { // 不展开根节点
+            [self.outline expandItem:parent];
+            NSLog(@"[BookmarkHighlight] 展开父节点: %@", parent.title);
+        }
+    }
+}
+
+- (BOOL)findParentPathForItem:(TocNode*)targetItem inNode:(TocNode*)currentNode parentPath:(NSMutableArray*)path {
+    if (!currentNode) return NO;
+    
+    // 将当前节点加入路径
+    [path addObject:currentNode];
+    
+    // 检查是否找到目标项
+    if (currentNode == targetItem) {
+        return YES;
+    }
+    
+    // 在子节点中搜索
+    for (TocNode* child in currentNode.children) {
+        if ([self findParentPathForItem:targetItem inNode:child parentPath:path]) {
+            return YES;
+        }
+    }
+    
+    // 如果在这个分支中没找到，从路径中移除当前节点
+    [path removeLastObject];
+    return NO;
+}
+
+- (void)createExpandedBookmarkControls {
+    NSLog(@"[BookmarkControl] 创建展开状态的书签控件");
+    
+    // 完全隐藏收起状态的控制栏，确保不会阻挡事件
+    self.bookmarkControlBar.hidden = YES;
+    self.bookmarkControlBar.alphaValue = 0.0; // 完全透明
+    [self.bookmarkControlBar removeFromSuperview]; // 临时从视图层次中移除
+    
+    // 创建顶部控制栏（包含标题、+/-按钮）
+    CGFloat controlBarHeight = 30;
+    CGFloat expandedWidth = 260; // 使用展开状态的固定宽度
+    self.expandedTopControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.leftPanel.bounds.size.height - controlBarHeight, expandedWidth, controlBarHeight)];
+    self.expandedTopControlBar.wantsLayer = YES;
+    self.expandedTopControlBar.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
+    
+    // 添加底部分隔线
+    NSView* separator = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, self.expandedTopControlBar.bounds.size.width, 1)];
+    separator.wantsLayer = YES;
+    separator.layer.backgroundColor = [[NSColor separatorColor] CGColor];
+    [self.expandedTopControlBar addSubview:separator];
+    
+    // 添加标题标签
+    NSTextField* titleLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(10, 6, 50, 18)];
+    titleLabel.stringValue = @"书签";
+    titleLabel.font = [NSFont systemFontOfSize:13];
+    titleLabel.textColor = [NSColor labelColor];
+    titleLabel.backgroundColor = [NSColor clearColor];
+    titleLabel.bordered = NO;
+    titleLabel.editable = NO;
+    titleLabel.selectable = NO;
+    [self.expandedTopControlBar addSubview:titleLabel];
+    
+    // 添加展开所有按钮（+）
+    NSButton* expandAllButton = [[NSButton alloc] initWithFrame:NSMakeRect(70, 3, 24, 24)];
+    expandAllButton.title = @"+";
+    expandAllButton.font = [NSFont systemFontOfSize:14];
+    expandAllButton.bordered = NO;
+    expandAllButton.target = self;
+    expandAllButton.action = @selector(expandAllBookmarks:);
+    [self.expandedTopControlBar addSubview:expandAllButton];
+    NSLog(@"[BookmarkControl] +按钮创建: frame=%@, superview=%@", NSStringFromRect(expandAllButton.frame), expandAllButton.superview);
+    
+    // 添加折叠所有按钮（-）
+    NSButton* collapseAllButton = [[NSButton alloc] initWithFrame:NSMakeRect(100, 3, 24, 24)];
+    collapseAllButton.title = @"−";
+    collapseAllButton.font = [NSFont systemFontOfSize:14];
+    collapseAllButton.bordered = NO;
+    collapseAllButton.target = self;
+    collapseAllButton.action = @selector(collapseAllBookmarks:);
+    [self.expandedTopControlBar addSubview:collapseAllButton];
+    NSLog(@"[BookmarkControl] -按钮创建: frame=%@, superview=%@", NSStringFromRect(collapseAllButton.frame), collapseAllButton.superview);
+    
+    // 添加展开状态的收起按钮（位于右侧边缘）
+    CGFloat buttonWidth = 16;
+    CGFloat buttonHeight = 16;
+    CGFloat rightMargin = 4;
+    CGFloat yCenter = (controlBarHeight - buttonHeight) / 2;
+    CGFloat buttonX = self.expandedTopControlBar.bounds.size.width - buttonWidth - rightMargin;
+    NSButton* collapseButton = [[NSButton alloc] initWithFrame:NSMakeRect(buttonX, yCenter, buttonWidth, buttonHeight)];
+    collapseButton.title = @"◀"; // 左箭头表示可以收起
+    collapseButton.font = [NSFont systemFontOfSize:10];
+    collapseButton.bordered = NO;
+    collapseButton.target = self;
+    collapseButton.action = @selector(toggleBookmarkVisibility:);
+    [self.expandedTopControlBar addSubview:collapseButton];
+    NSLog(@"[BookmarkControl] ◀按钮创建: frame=%@, expandedTopControlBar.bounds=%@", NSStringFromRect(collapseButton.frame), NSStringFromRect(self.expandedTopControlBar.bounds));
+    
+    [self.leftPanel addSubview:self.expandedTopControlBar];
+    NSLog(@"[BookmarkControl] expandedTopControlBar创建: frame=%@, leftPanel.bounds=%@", NSStringFromRect(self.expandedTopControlBar.frame), NSStringFromRect(self.leftPanel.bounds));
+    
+    // 显示书签列表
+    self.outlineScroll.hidden = NO;
+}
+
+- (void)removeExpandedBookmarkControls {
+    NSLog(@"[BookmarkControl] 移除展开状态的书签控件");
+    
+    // 移除顶部控制栏
+    if (self.expandedTopControlBar) {
+        [self.expandedTopControlBar removeFromSuperview];
+        self.expandedTopControlBar = nil;
+    }
+    
+    // 恢复收起状态的控制栏
+    [self.leftPanel addSubview:self.bookmarkControlBar];
+    self.bookmarkControlBar.hidden = NO;
+    self.bookmarkControlBar.alphaValue = 1.0; // 恢复不透明
+    
+    // 隐藏书签列表
+    self.outlineScroll.hidden = YES;
+}
+
+
+
+- (void)updateStatusBar {
+    NSLog(@"[StatusBar] updateStatusBar被调用");
+    
+    @try {
+        NSLog(@"[StatusBar] 检查self.view...");
+        if (!self.view) {
+            NSLog(@"[StatusBar] self.view为nil");
+            return;
+        }
+        NSLog(@"[StatusBar] self.view: %@", self.view);
+        
+        NSLog(@"[StatusBar] 检查document...");
+        FPDF_DOCUMENT doc = [self.view document];
+        NSLog(@"[StatusBar] document: %p", doc);
+        
+        NSLog(@"[StatusBar] 检查状态栏组件...");
+        NSLog(@"[StatusBar] statusBar: %@", self.statusBar);
+        NSLog(@"[StatusBar] pageInput: %@", self.pageInput);
+        NSLog(@"[StatusBar] totalPagesLabel: %@", self.totalPagesLabel);
+        NSLog(@"[StatusBar] prevPageButton: %@", self.prevPageButton);
+        NSLog(@"[StatusBar] nextPageButton: %@", self.nextPageButton);
+        
+        // 检查状态栏组件是否已初始化
+        if (!self.statusBar || !self.pageInput || !self.totalPagesLabel || !self.prevPageButton || !self.nextPageButton) {
+            NSLog(@"[StatusBar] 状态栏组件未初始化，跳过更新");
+            return;
+        }
+        
+        if (!doc) {
+            NSLog(@"[StatusBar] 没有文档，设置默认值");
+            self.pageInput.stringValue = @"1";
+            self.totalPagesLabel.stringValue = @"/ 0";
+            self.prevPageButton.enabled = NO;
+            self.nextPageButton.enabled = NO;
+            return;
+        }
+        
+        NSLog(@"[StatusBar] 获取页面信息...");
+        int currentPage = [self.view currentPageIndex] + 1; // 显示从1开始的页码
+        int totalPages = FPDF_GetPageCount(doc);
+        
+        NSLog(@"[StatusBar] 当前页: %d, 总页数: %d", currentPage, totalPages);
+        
+        NSLog(@"[StatusBar] 更新UI组件...");
+        self.pageInput.stringValue = [NSString stringWithFormat:@"%d", currentPage];
+        self.totalPagesLabel.stringValue = [NSString stringWithFormat:@"/ %d", totalPages];
+        
+        self.prevPageButton.enabled = (currentPage > 1);
+        self.nextPageButton.enabled = (currentPage < totalPages);
+        
+        NSLog(@"[StatusBar] 状态栏更新完成: %@ %@", self.pageInput.stringValue, self.totalPagesLabel.stringValue);
+    }
+    @catch (NSException *exception) {
+        NSLog(@"[StatusBar] 异常: %@", exception);
+    }
+}
+
+- (void)onPrevPage:(id)sender {
+    if (!self.view || ![self.view document]) return;
+    int currentPage = [self.view currentPageIndex];
+    if (currentPage > 0) {
+        [self.view goToPage:currentPage - 1];
+        [self updateStatusBar];
+    }
+}
+
+- (void)onNextPage:(id)sender {
+    if (!self.view || ![self.view document]) return;
+    int totalPages = FPDF_GetPageCount([self.view document]);
+    int currentPage = [self.view currentPageIndex];
+    if (currentPage < totalPages - 1) {
+        [self.view goToPage:currentPage + 1];
+        [self updateStatusBar];
+    }
+}
+
+- (void)onPageInputChanged:(id)sender {
+    if (!self.view || ![self.view document]) return;
+    
+    NSString* input = self.pageInput.stringValue;
+    int pageNum = [input intValue];
+    int totalPages = FPDF_GetPageCount([self.view document]);
+    
+    if (pageNum >= 1 && pageNum <= totalPages) {
+        [self.view goToPage:pageNum - 1]; // 转换为0开始的索引
+        [self updateStatusBar];
+    } else {
+        // 输入无效，恢复当前页码
+        [self updateStatusBar];
+    }
+}
+
+#pragma mark - PdfViewDelegate
+
+- (void)pdfViewDidChangePage:(id)sender {
+    NSLog(@"[StatusBar] pdfViewDidChangePage被调用");
+    if (self.statusBar) {
+        [self updateStatusBar];
+    } else {
+        NSLog(@"[StatusBar] 状态栏尚未初始化，跳过更新");
+    }
+    
+    // 高亮当前书签
+    [self highlightCurrentBookmark];
 }
 
 @end
