@@ -40,6 +40,9 @@ if (WIN32)
     PdfWinViewer/Main.cpp
   )
 elseif(APPLE)
+  # 添加PDFium扩展库
+  add_subdirectory(third_party/pdfium_ex)
+  
   add_executable(PdfWinViewer MACOSX_BUNDLE
     platform/shared/pdf_utils.cpp
     platform/mac/App.mm
@@ -58,6 +61,7 @@ endif()
 target_include_directories(PdfWinViewer PRIVATE
   "${PDFIUM_PUBLIC_DIR}"
   "${PDFIUM_ROOT}/include" # 兼容某些发行包/旧布局
+  "third_party/pdfium_ex/include" # PDFium扩展库头文件
 )
 
 if (WIN32)
@@ -73,7 +77,10 @@ if (WIN32)
   )
 elseif(APPLE)
   # 仅静态链接
-  target_link_libraries(PdfWinViewer PRIVATE "${PDFIUM_STATIC}")
+  target_link_libraries(PdfWinViewer PRIVATE 
+    "${PDFIUM_STATIC}"
+    pdfium_ex
+  )
   message(STATUS "Linking against static PDFium: ${PDFIUM_STATIC}")
   # 尝试链接 PDFium 构建产物自带的静态 libc++ 与 libc++abi（pdfium 完整静态库仍引用它们）
   get_filename_component(_PDFIUM_OBJ_DIR "${PDFIUM_STATIC}" DIRECTORY) # .../out/<cfg>/obj

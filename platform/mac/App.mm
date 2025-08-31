@@ -10,6 +10,7 @@
 #include <fpdf_edit.h>
 #include "../shared/pdf_utils.h"
 #include <fpdf_doc.h>
+#include "pdfium_object_info.h"
 #include <mach/mach.h>
 #include <vector>
 #include <string>
@@ -302,6 +303,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 @protocol PdfViewDelegate <NSObject>
 @optional
 - (void)pdfViewDidChangePage:(id)sender;
+- (void)pdfViewDidClickObject:(NSValue*)objectValue atIndex:(NSNumber*)index;
 @end
 
 @interface PdfView : NSView
@@ -312,6 +314,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 - (int)currentPageIndex; // 获取当前页索引（0开始）
 - (NSSize)currentPageSizePt; // 当前页 PDF 尺寸（pt）
 - (void)updateViewSizeToFitPage; // 根据页尺寸与缩放调整自身 frame 大小（供滚动容器使用）
+- (BOOL)findText:(NSString*)searchText fromIndex:(NSNumber*)startIndex; // 文本查找功能
 @end
 
 @implementation PdfView {
@@ -620,6 +623,9 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     } else {
         // 非选择：尝试链接跳转
         [self tryNavigateLinkAtPoint:up];
+        
+        // 检测点击的PDF对象并通知检查器
+        [self detectObjectAtPoint:up];
     }
 }
 
@@ -815,13 +821,13 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
             NSLog(@"[PageNavigation] 输入页码超过最大值%ld，调整为最大值: %ld", (long)pc, (long)v);
         }
         
-        int oldIndex = _pageIndex;
+            int oldIndex = _pageIndex;
         _pageIndex = (int)v - 1; // 转换为0基索引
         NSLog(@"[PageNavigation] 设置页码为: %ld (索引: %d)", (long)v, _pageIndex);
-        [self setNeedsDisplay:YES]; 
+            [self setNeedsDisplay:YES]; 
         
-        if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
-            [self.delegate pdfViewDidChangePage:self];
+            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+                [self.delegate pdfViewDidChangePage:self];
         }
     }
 }
@@ -997,6 +1003,119 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     NSLog(@"[PdfWinViewer][saveImage] save completed: %@, path: %@", saveSuccess ? @"SUCCESS" : @"FAILED", url.path);
     MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] final result: %@", saveSuccess ? @"SUCCESS" : @"FAILED"]);
 }
+
+// 检测点击位置的PDF对象
+- (void)detectObjectAtPoint:(NSPoint)viewPoint {
+    if (!_doc) return;
+    
+    NSPoint pageXY = [self toPagePxFromView:viewPoint];
+    double px = pageXY.x, py = pageXY.y;
+    
+    FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
+    if (!page) return;
+    
+    // 遍历页面上的所有对象
+    int totalObjs = FPDFPage_CountObjects(page);
+    NSLog(@"[PdfView] 检测点击位置 (%.1f, %.1f)，页面共有 %d 个对象", px, py, totalObjs);
+    
+    for (int i = 0; i < totalObjs; i++) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+        if (!obj) continue;
+        
+        // 获取对象边界
+        float left, bottom, right, top;
+        if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+            // 检查点击是否在对象边界内
+            if (px >= left && px <= right && py >= bottom && py <= top) {
+                int objType = FPDFPageObj_GetType(obj);
+                NSLog(@"[PdfView] 点击命中对象 %d，类型: %d，边界: (%.1f,%.1f,%.1f,%.1f)", 
+                      i, objType, left, bottom, right, top);
+                
+                // 通知AppDelegate跳转到检查器中的对应对象
+                if (self.delegate && [self.delegate respondsToSelector:@selector(pdfViewDidClickObject:atIndex:)]) {
+                    // 将FPDF_PAGEOBJECT包装为NSValue传递
+                    NSValue* objValue = [NSValue valueWithPointer:obj];
+                    [self.delegate performSelector:@selector(pdfViewDidClickObject:atIndex:) 
+                                        withObject:objValue 
+                                        withObject:@(i)];
+                }
+                break; // 只处理第一个命中的对象
+            }
+        }
+    }
+    
+    FPDF_ClosePage(page);
+}
+
+// 文本查找功能
+- (BOOL)findText:(NSString*)searchText fromIndex:(NSNumber*)startIndex {
+    if (!_doc || !searchText || searchText.length == 0) {
+        NSLog(@"[PdfView] 查找失败：无效的文档或搜索文本");
+        return NO;
+    }
+    
+    FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
+    if (!page) {
+        NSLog(@"[PdfView] 查找失败：无法加载页面 %d", _pageIndex);
+        return NO;
+    }
+    
+    // 加载文本页面
+    FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+    if (!textPage) {
+        NSLog(@"[PdfView] 查找失败：无法加载文本页面");
+        FPDF_ClosePage(page);
+        return NO;
+    }
+    
+    // 将NSString转换为FPDF_WIDESTRING
+    NSData* utf16Data = [searchText dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
+    FPDF_WIDESTRING wideString = (FPDF_WIDESTRING)utf16Data.bytes;
+    
+    int startIdx = startIndex ? [startIndex intValue] : 0;
+    NSLog(@"[PdfView] 开始查找文本: '%@'，起始索引: %d", searchText, startIdx);
+    
+    // 开始搜索
+    FPDF_SCHHANDLE searchHandle = FPDFText_FindStart(textPage, wideString, 0, startIdx);
+    if (!searchHandle) {
+        NSLog(@"[PdfView] 查找失败：无法创建搜索句柄");
+        FPDFText_ClosePage(textPage);
+        FPDF_ClosePage(page);
+        return NO;
+    }
+    
+    // 查找下一个匹配
+    BOOL found = FPDFText_FindNext(searchHandle);
+    if (found) {
+        int resultIndex = FPDFText_GetSchResultIndex(searchHandle);
+        int resultCount = FPDFText_GetSchCount(searchHandle);
+        NSLog(@"[PdfView] 找到匹配文本，位置: %d，长度: %d", resultIndex, resultCount);
+        
+        // 获取匹配文本的边界框以便高亮显示
+        double left, top, right, bottom;
+        if (FPDFText_GetCharBox(textPage, resultIndex, &left, &bottom, &right, &top)) {
+            NSLog(@"[PdfView] 匹配文本边界: (%.1f, %.1f, %.1f, %.1f)", left, bottom, right, top);
+            
+            // 将PDF坐标转换为视图坐标并滚动到可见区域
+            NSPoint viewPoint = [self toViewFromPagePx:NSMakePoint(left, top)];
+            NSRect visibleRect = NSMakeRect(viewPoint.x - 50, viewPoint.y - 50, 100, 100);
+            [self scrollRectToVisible:visibleRect];
+            
+            // 标记需要重绘以显示高亮
+            [self setNeedsDisplay:YES];
+        }
+    } else {
+        NSLog(@"[PdfView] 未找到匹配的文本");
+    }
+    
+    // 清理资源
+    FPDFText_FindClose(searchHandle);
+    FPDFText_ClosePage(textPage);
+    FPDF_ClosePage(page);
+    
+    return found;
+}
+
 @end
 
 // 书签节点模型
@@ -1048,7 +1167,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     return root;
 }
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, PdfViewDelegate, NSSplitViewDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, PdfViewDelegate, NSSplitViewDelegate, NSTextViewDelegate>
 @property (nonatomic, strong) NSWindow* window;
 @property (nonatomic, strong) NSSplitView* split;
 @property (nonatomic, strong) NSOutlineView* outline;
@@ -1084,6 +1203,13 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 @property (nonatomic, assign) BOOL inspectorVisible; // 检查器是否可见
 @property (nonatomic, strong) NSTextView* inspectorTextView; // 检查器文本视图
 @property (nonatomic, strong) NSScrollView* inspectorScrollView; // 检查器滚动视图
+@property (nonatomic, strong) NSMutableDictionary* objectPositions; // 对象号 -> 文本位置映射
+
+// 页面查找功能
+@property (nonatomic, strong) NSPanel* findPanel; // 查找面板
+@property (nonatomic, strong) NSTextField* findTextField; // 查找输入框
+@property (nonatomic, strong) NSString* lastSearchTerm; // 上次查找的内容
+@property (nonatomic, assign) NSInteger currentSearchIndex; // 当前查找结果索引
 @end
 
 // 为在主实现中调用分类方法提供前置声明（命名分类，避免"primary class"重复实现告警）
@@ -1119,6 +1245,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 - (void)toggleInspectorVisibility:(id)sender;
 - (void)setInspectorVisible:(BOOL)visible animated:(BOOL)animated;
 - (void)updateInspectorLayout;
+- (void)displayObjectTreeNode:(PDFIUM_EX_OBJECT_TREE_NODE*)node 
+                attributedString:(NSMutableAttributedString*)attributedInfo 
+                      normalAttrs:(NSDictionary*)normalAttrs 
+                       objNumAttrs:(NSDictionary*)objNumAttrs;
 - (void)updateInspectorContent;
 @end
 
@@ -1425,7 +1555,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
         [self ensureBookmarkScrollBarVisible];
     });
     
-    // 添加全局键盘事件监听，确保PageUp/PageDown总是控制PDF翻页
+    // 添加全局键盘事件监听，确保PageUp/PageDown总是控制PDF翻页，并支持cmd+f查找
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent * _Nullable(NSEvent * _Nonnull event) {
         return [self handleGlobalKeyDown:event];
     }];
@@ -1443,6 +1573,13 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     NSString* chars = [event charactersIgnoringModifiers];
     unichar c = chars.length ? [chars characterAtIndex:0] : 0;
     NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    
+    // 处理cmd+f查找功能
+    if (c == 'f' && (mods & NSEventModifierFlagCommand)) {
+        NSLog(@"[GlobalKey] 拦截到Cmd+F，显示查找面板");
+        [self showFindPanel];
+        return nil; // 消费事件
+    }
     
     // 拦截翻页相关的键盘事件，总是路由到PDF视图
     BOOL isPageNavigationKey = NO;
@@ -1473,6 +1610,180 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     
     return event; // 其他键盘事件正常传递
 }
+
+#pragma mark - Find Panel Implementation
+
+// 显示查找面板
+- (void)showFindPanel {
+    if (!self.findPanel) {
+        // 创建查找面板
+        NSRect panelFrame = NSMakeRect(0, 0, 300, 80);
+        self.findPanel = [[NSPanel alloc] initWithContentRect:panelFrame
+                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+        self.findPanel.title = @"在检查器中查找";
+        self.findPanel.level = NSFloatingWindowLevel;
+        
+        // 创建查找输入框
+        NSRect textFieldFrame = NSMakeRect(20, 30, 200, 25);
+        self.findTextField = [[NSTextField alloc] initWithFrame:textFieldFrame];
+        self.findTextField.placeholderString = @"在页面元素窗口中查找...";
+        self.findTextField.target = self;
+        self.findTextField.action = @selector(performFind:);
+        
+        // 创建查找按钮
+        NSRect findButtonFrame = NSMakeRect(230, 30, 50, 25);
+        NSButton* findButton = [[NSButton alloc] initWithFrame:findButtonFrame];
+        findButton.title = @"查找";
+        findButton.target = self;
+        findButton.action = @selector(performFind:);
+        findButton.keyEquivalent = @"\r"; // Enter键
+        
+        [self.findPanel.contentView addSubview:self.findTextField];
+        [self.findPanel.contentView addSubview:findButton];
+    }
+    
+    // 显示面板并聚焦输入框
+    [self.findPanel center];
+    [self.findPanel makeKeyAndOrderFront:nil];
+    [self.findPanel makeFirstResponder:self.findTextField];
+}
+
+// 执行查找
+- (void)performFind:(id)sender {
+    NSString* searchTerm = self.findTextField.stringValue;
+    if (!searchTerm || searchTerm.length == 0) return;
+    
+    // 检查检查器是否可见和可用
+    if (!self.inspectorVisible || !self.inspectorTextView) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText = @"查找提示";
+        alert.informativeText = @"请先打开检查器窗口（右侧面板）";
+        [alert addButtonWithTitle:@"确定"];
+        [alert runModal];
+        return;
+    }
+    
+    NSString* inspectorText = self.inspectorTextView.string;
+    if (!inspectorText || inspectorText.length == 0) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText = @"查找提示";
+        alert.informativeText = @"检查器窗口中没有内容可搜索";
+        [alert addButtonWithTitle:@"确定"];
+        [alert runModal];
+        return;
+    }
+    
+    // 检查是否是新的搜索词
+    NSRange searchRange;
+    if (![searchTerm isEqualToString:self.lastSearchTerm]) {
+        self.lastSearchTerm = searchTerm;
+        self.currentSearchIndex = 0;
+        searchRange = NSMakeRange(0, inspectorText.length);
+    } else {
+        // 从上次找到的位置之后开始搜索
+        NSUInteger startPos = self.currentSearchIndex + [self.lastSearchTerm length];
+        if (startPos >= inspectorText.length) {
+            // 到达末尾，从头开始
+            startPos = 0;
+        }
+        searchRange = NSMakeRange(startPos, inspectorText.length - startPos);
+    }
+    
+    // 在检查器文本中查找
+    NSRange foundRange = [inspectorText rangeOfString:searchTerm 
+                                              options:NSCaseInsensitiveSearch 
+                                                range:searchRange];
+    
+    if (foundRange.location != NSNotFound) {
+        // 找到了，更新索引并高亮显示
+        self.currentSearchIndex = foundRange.location;
+        
+        // 滚动到找到的位置并高亮显示
+        [self.inspectorTextView scrollRangeToVisible:foundRange];
+        [self.inspectorTextView setSelectedRange:foundRange];
+        [self.inspectorTextView showFindIndicatorForRange:foundRange];
+        
+        NSLog(@"[Find] 在检查器中找到文本: %@ at 位置: %lu", searchTerm, foundRange.location);
+    } else if (self.currentSearchIndex > 0) {
+        // 没找到，尝试从头开始搜索
+        foundRange = [inspectorText rangeOfString:searchTerm 
+                                          options:NSCaseInsensitiveSearch 
+                                            range:NSMakeRange(0, inspectorText.length)];
+        if (foundRange.location != NSNotFound) {
+            self.currentSearchIndex = foundRange.location;
+            [self.inspectorTextView scrollRangeToVisible:foundRange];
+            [self.inspectorTextView setSelectedRange:foundRange];
+            [self.inspectorTextView showFindIndicatorForRange:foundRange];
+            NSLog(@"[Find] 在检查器中找到文本（从头开始）: %@ at 位置: %lu", searchTerm, foundRange.location);
+        } else {
+            // 真的没找到
+            [self showNotFoundAlert:searchTerm];
+        }
+    } else {
+        // 没找到
+        [self showNotFoundAlert:searchTerm];
+    }
+}
+
+// 显示未找到文本的提示
+- (void)showNotFoundAlert:(NSString*)searchTerm {
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.messageText = @"查找结果";
+    alert.informativeText = [NSString stringWithFormat:@"在检查器窗口中未找到文本: %@", searchTerm];
+    [alert addButtonWithTitle:@"确定"];
+    [alert runModal];
+    NSLog(@"[Find] 在检查器中未找到文本: %@", searchTerm);
+}
+
+// 为对象引用着色的辅助方法
+- (NSMutableAttributedString*)colorizeObjectReferences:(NSString*)text normalAttrs:(NSDictionary*)normalAttrs {
+    NSMutableAttributedString* result = [[NSMutableAttributedString alloc] initWithString:text attributes:normalAttrs];
+    
+    // 创建绿色属性
+    NSDictionary* greenAttrs = @{
+        NSForegroundColorAttributeName: [NSColor systemGreenColor],
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightBold]
+    };
+    
+    // 查找所有对象引用（格式：数字 0 R）
+    NSError* error = nil;
+    NSRegularExpression* regex = [NSRegularExpression regularExpressionWithPattern:@"\\b(\\d+)\\s+0\\s+R\\b" 
+                                                                           options:0 
+                                                                             error:&error];
+    if (error) {
+        NSLog(@"[Inspector] 对象引用正则表达式错误: %@", error.localizedDescription);
+        return result;
+    }
+    
+    // 应用绿色到所有匹配的对象引用
+    [regex enumerateMatchesInString:text 
+                            options:0 
+                              range:NSMakeRange(0, text.length) 
+                         usingBlock:^(NSTextCheckingResult *match, NSMatchingFlags flags, BOOL *stop) {
+        NSRange matchRange = [match range];
+        [result setAttributes:greenAttrs range:matchRange];
+    }];
+    
+    return result;
+}
+
+// PDF视图对象点击处理
+- (void)pdfViewDidClickObject:(NSValue*)objectValue atIndex:(NSNumber*)index {
+    NSLog(@"[Inspector] PDF视图点击了对象，索引: %@", index);
+    
+    // 从NSValue中提取FPDF_PAGEOBJECT
+    FPDF_PAGEOBJECT object = (FPDF_PAGEOBJECT)[objectValue pointerValue];
+    
+    // 这里我们需要将FPDF_PAGEOBJECT映射到实际的PDF对象号
+    // 由于这比较复杂，我们先简单地刷新检查器内容，然后尝试跳转到相关对象
+    [self updateInspectorContent];
+    
+    // TODO: 实现更精确的对象映射和跳转
+    NSLog(@"[Inspector] 已刷新检查器内容以响应PDF对象点击");
+}
+
 @end
 
 #pragma mark - TOC (Outline)
@@ -1920,8 +2231,78 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 - (void)outlineView:(NSOutlineView *)outlineView didClickTableColumn:(NSTableColumn *)tableColumn {}
 - (void)outlineViewSelectionDidChange:(NSNotification *)notification {
     NSInteger row = self.outline.selectedRow; if (row < 0) return; id item = [self.outline itemAtRow:row];
-    TocNode* n = (TocNode*)item; if (n.pageIndex >= 0) { [self.view goToPage:n.pageIndex]; }
+    TocNode* n = (TocNode*)item; if (n.pageIndex >= 0) { [self.view goToPage:n.pageIndex];     }
 }
+
+// NSTextView点击处理
+- (BOOL)textView:(NSTextView *)textView clickedOnLink:(id)link atIndex:(NSUInteger)charIndex {
+    return NO; // 我们不使用链接，而是自定义处理
+}
+
+// 检查器文本视图点击处理
+- (void)inspectorTextViewClicked:(NSClickGestureRecognizer*)recognizer {
+    if (!self.inspectorTextView || !self.objectPositions) return;
+    
+    NSPoint clickPoint = [recognizer locationInView:self.inspectorTextView];
+    
+    // 获取点击位置的字符索引
+    NSUInteger charIndex = [self.inspectorTextView characterIndexForInsertionAtPoint:clickPoint];
+    NSString* text = self.inspectorTextView.string;
+    
+    NSLog(@"[Inspector] 点击位置: (%.1f, %.1f), 字符索引: %lu", clickPoint.x, clickPoint.y, charIndex);
+    
+    // 查找点击位置附近的对象引用（格式：数字 0 R）
+    NSError* error = nil;
+    NSRegularExpression* regex = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s+0\\s+R" 
+                                                                           options:0 
+                                                                             error:&error];
+    if (error) {
+        NSLog(@"[Inspector] 正则表达式错误: %@", error.localizedDescription);
+        return;
+    }
+    
+    __block uint32_t targetObjNum = 0;
+    __block NSRange foundRange = NSMakeRange(NSNotFound, 0);
+    [regex enumerateMatchesInString:text 
+                            options:0 
+                              range:NSMakeRange(0, text.length) 
+                         usingBlock:^(NSTextCheckingResult *match, NSMatchingFlags flags, BOOL *stop) {
+        NSRange matchRange = [match range];
+        NSLog(@"[Inspector] 找到匹配: %@, 范围: %@", [text substringWithRange:matchRange], NSStringFromRange(matchRange));
+        
+        if (charIndex >= matchRange.location && charIndex <= matchRange.location + matchRange.length) {
+            NSString* objNumStr = [text substringWithRange:[match rangeAtIndex:1]];
+            targetObjNum = (uint32_t)[objNumStr integerValue];
+            foundRange = matchRange;
+            NSLog(@"[Inspector] 点击命中对象引用: %u", targetObjNum);
+            *stop = YES;
+        }
+    }];
+    
+    // 如果找到目标对象号，跳转到对应位置
+    if (targetObjNum > 0) {
+        NSString* objKey = [NSString stringWithFormat:@"%u", targetObjNum];
+        NSNumber* position = [self.objectPositions objectForKey:objKey];
+        NSLog(@"[Inspector] 查找对象 %u 的位置，映射表中有 %lu 个对象", targetObjNum, self.objectPositions.count);
+        
+        if (position) {
+            NSUInteger targetPos = [position unsignedIntegerValue];
+            NSRange targetRange = NSMakeRange(targetPos, 0);
+            [self.inspectorTextView scrollRangeToVisible:targetRange];
+            [self.inspectorTextView setSelectedRange:NSMakeRange(targetPos, 20)]; // 高亮显示更多字符
+            NSLog(@"[Inspector] 成功跳转到对象 %u，位置：%lu", targetObjNum, targetPos);
+        } else {
+            NSLog(@"[Inspector] 未找到对象 %u 的位置信息", targetObjNum);
+            // 打印所有可用的对象号
+            NSArray* allKeys = [self.objectPositions.allKeys sortedArrayUsingSelector:@selector(compare:)];
+            NSLog(@"[Inspector] 可用对象号: %@", allKeys);
+        }
+    } else {
+        NSLog(@"[Inspector] 点击位置未找到对象引用");
+    }
+}
+
+
 
 @end
 
@@ -2320,7 +2701,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     
     // 延迟更新滚动条，确保展开动画完成
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self updateBookmarkScrollView];
+    [self updateBookmarkScrollView];
         [self ensureBookmarkScrollBarVisible];
     });
 }
@@ -2331,7 +2712,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     
     // 延迟更新滚动条，确保折叠动画完成
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self updateBookmarkScrollView];
+    [self updateBookmarkScrollView];
         [self ensureBookmarkScrollBarVisible];
     });
 }
@@ -2677,7 +3058,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     // 应用有效的页码
     [self.view goToPage:validPageNum - 1]; // 转换为0开始的索引
     NSLog(@"[PageNavigation] 状态栏页码设置为: %d (索引: %d)", validPageNum, validPageNum - 1);
-    [self updateStatusBar];
+        [self updateStatusBar];
 }
 
 #pragma mark - PdfViewDelegate
@@ -2748,6 +3129,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.inspectorTextView = [[NSTextView alloc] initWithFrame:textFrame];
     self.inspectorTextView.editable = NO;
     self.inspectorTextView.selectable = YES;
+    
+    // 初始化对象位置映射
+    self.objectPositions = [[NSMutableDictionary alloc] init];
+    self.inspectorTextView.delegate = self; // 设置代理以处理点击事件
     self.inspectorTextView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     self.inspectorTextView.textColor = [NSColor labelColor];
     self.inspectorTextView.backgroundColor = [NSColor textBackgroundColor];
@@ -2762,6 +3147,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.inspectorTextView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.inspectorTextView.horizontallyResizable = NO;  // 禁用水平调整
     self.inspectorTextView.verticallyResizable = YES;   // 启用垂直调整
+    
+    // 添加鼠标点击事件监听
+    NSClickGestureRecognizer* clickGesture = [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(inspectorTextViewClicked:)];
+    [self.inspectorTextView addGestureRecognizer:clickGesture];
     
     NSLog(@"[Inspector] 文本视图自动换行配置完成，容器宽度: %.1f", textFrame.size.width);
     
@@ -2833,6 +3222,55 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     NSLog(@"[Inspector] 文本容器宽度已更新为: %.1f", newWidth);
 }
 
+// 递归显示对象树节点
+- (void)displayObjectTreeNode:(PDFIUM_EX_OBJECT_TREE_NODE*)node 
+                attributedString:(NSMutableAttributedString*)attributedInfo 
+                      normalAttrs:(NSDictionary*)normalAttrs 
+                       objNumAttrs:(NSDictionary*)objNumAttrs {
+    if (!node || !attributedInfo || !normalAttrs || !objNumAttrs) return;
+    
+    // 安全检查：防止递归过深
+    if (node->depth > 10) {
+        NSString* warningStr = [NSString stringWithFormat:@"[警告] 对象 %u 递归深度过深，已停止展开\n\n", node->obj_num];
+        [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:warningStr attributes:normalAttrs]];
+        return;
+    }
+    
+    // 记录对象在文本中的位置（用于点击跳转）
+    NSUInteger objStartPosition = attributedInfo.length;
+    NSString* objKey = [NSString stringWithFormat:@"%u", node->obj_num];
+    [self.objectPositions setObject:@(objStartPosition) forKey:objKey];
+    
+    // 显示对象号（天空蓝色）
+    NSString* objNumStr = [NSString stringWithFormat:@"%u %u obj", node->obj_num, node->gen_num];
+    if (objNumStr) {
+        [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:objNumStr attributes:objNumAttrs]];
+    }
+    [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n<<\n" attributes:normalAttrs]];
+    
+    // 显示对象内容（安全检查）
+    if (node->raw_content && strlen(node->raw_content) > 0) {
+        NSString* contentStr = [NSString stringWithUTF8String:node->raw_content];
+        if (contentStr && contentStr.length > 0) {
+            // 创建带颜色的内容字符串，将对象引用标记为绿色
+            NSMutableAttributedString* coloredContent = [self colorizeObjectReferences:contentStr normalAttrs:normalAttrs];
+            [attributedInfo appendAttributedString:coloredContent];
+            [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:normalAttrs]];
+        }
+    }
+    
+    [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:@">>\nendobj\n\n" attributes:normalAttrs]];
+    
+    // 如果有子节点，直接显示子节点（添加安全检查）
+    if (node->children && node->child_count > 0 && node->child_count < 200) { // 增加子节点数量限制
+        for (int i = 0; i < node->child_count; i++) {
+            if (node->children[i]) {
+                [self displayObjectTreeNode:node->children[i] attributedString:attributedInfo normalAttrs:normalAttrs objNumAttrs:objNumAttrs];
+            }
+        }
+    }
+}
+
 - (void)updateInspectorContent {
     if (!self.inspectorVisible || !self.inspectorTextView || !self.view) return;
     
@@ -2859,138 +3297,45 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     // 获取页面对象数量
     int objectCount = FPDFPage_CountObjects(page);
     
-    // 构建信息文本
-    NSMutableString* info = [NSMutableString string];
-    [info appendFormat:@"PDF 文档信息\n"];
-    [info appendFormat:@"================\n\n"];
-    [info appendFormat:@"当前页面: %d / %d\n", currentPage + 1, totalPages];
-    [info appendFormat:@"页面尺寸: %.2f x %.2f pt\n", pageWidth, pageHeight];
-    [info appendFormat:@"页面对象数: %d\n\n", objectCount];
+    // 构建带颜色的属性文本
+    NSMutableAttributedString* attributedInfo = [[NSMutableAttributedString alloc] init];
     
-    [info appendFormat:@"页面对象列表\n"];
-    [info appendFormat:@"================\n"];
+    // 基础文本属性
+    NSDictionary* normalAttrs = @{
+        NSForegroundColorAttributeName: [NSColor textColor],
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular]
+    };
     
-    // 遍历页面对象，按PDF标准格式显示
-    for (int i = 0; i < objectCount; i++) {
-        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-        if (!obj) continue;
+    // 天空蓝色对象号属性
+    NSDictionary* objNumAttrs = @{
+        NSForegroundColorAttributeName: [NSColor systemBlueColor],
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightBold]
+    };
+    
+    // 添加基础信息
+    NSString* basicInfo = [NSString stringWithFormat:@"PDF 文档信息\n================\n\n当前页面: %d / %d\n页面尺寸: %.2f x %.2f pt\n页面对象数: %d\n\nPDF对象引用树\n================\n", 
+                          currentPage + 1, totalPages, pageWidth, pageHeight, objectCount];
+    [attributedInfo appendAttributedString:[[NSAttributedString alloc] initWithString:basicInfo attributes:normalAttrs]];
+    
+    // 清空对象位置映射
+    [self.objectPositions removeAllObjects];
+    
+    // 构建PDF对象引用树
+    PDFIUM_EX_OBJECT_TREE_NODE* object_tree = PdfiumEx_BuildObjectTree(doc, page, 5); // 最大深度5层，支持完整分析
+    
+    if (object_tree) {
+        // 递归显示树结构
+        [self displayObjectTreeNode:object_tree attributedString:attributedInfo normalAttrs:normalAttrs objNumAttrs:objNumAttrs];
         
-        // 获取对象类型
-        int objType = FPDFPageObj_GetType(obj);
-        
-        // 模拟对象号（使用页面内索引+基础偏移）
-        int objectNumber = i + 10; // 假设页面对象从10开始编号
-        int generationNumber = 0;   // 通常为0
-        
-        [info appendFormat:@"%d %d obj\n", objectNumber, generationNumber];
-        [info appendFormat:@"<<\n"];
-        
-        // 根据对象类型添加相应的字典内容
-        switch (objType) {
-            case FPDF_PAGEOBJ_TEXT: {
-                [info appendFormat:@"  /Type /Text\n"];
-                
-                // 获取对象边界框
-                float left, bottom, right, top;
-                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
-                }
-                
-                // 尝试获取文本颜色
-                unsigned int R, G, B, A;
-                if (FPDFPageObj_GetFillColor(obj, &R, &G, &B, &A)) {
-                    [info appendFormat:@"  /FillColor [%d %d %d]\n", R, G, B];
-                }
-                
-                // 获取变换矩阵
-                FS_MATRIX matrix;
-                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
-                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
-                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
-                }
-                
-                [info appendFormat:@"  /Subtype /Text\n"];
-                break;
-            }
-            case FPDF_PAGEOBJ_PATH: {
-                [info appendFormat:@"  /Type /Path\n"];
-                
-                float left, bottom, right, top;
-                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
-                }
-                
-                // 获取填充颜色
-                unsigned int R, G, B, A;
-                if (FPDFPageObj_GetFillColor(obj, &R, &G, &B, &A)) {
-                    [info appendFormat:@"  /FillColor [%d %d %d]\n", R, G, B];
-                }
-                
-                // 获取描边颜色
-                if (FPDFPageObj_GetStrokeColor(obj, &R, &G, &B, &A)) {
-                    [info appendFormat:@"  /StrokeColor [%d %d %d]\n", R, G, B];
-                }
-                
-                // 获取变换矩阵
-                FS_MATRIX matrix;
-                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
-                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
-                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
-                }
-                break;
-            }
-            case FPDF_PAGEOBJ_IMAGE: {
-                [info appendFormat:@"  /Type /XObject\n"];
-                [info appendFormat:@"  /Subtype /Image\n"];
-                
-                float left, bottom, right, top;
-                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
-                }
-                
-                // 获取变换矩阵
-                FS_MATRIX matrix;
-                if (FPDFPageObj_GetMatrix(obj, &matrix)) {
-                    [info appendFormat:@"  /Matrix [%.2f %.2f %.2f %.2f %.2f %.2f]\n", 
-                        matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f];
-                }
-                break;
-            }
-            case FPDF_PAGEOBJ_SHADING: {
-                [info appendFormat:@"  /Type /Shading\n"];
-                
-                float left, bottom, right, top;
-                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
-                }
-                break;
-            }
-            case FPDF_PAGEOBJ_FORM: {
-                [info appendFormat:@"  /Type /XObject\n"];
-                [info appendFormat:@"  /Subtype /Form\n"];
-                
-                float left, bottom, right, top;
-                if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
-                    [info appendFormat:@"  /BBox [%.1f %.1f %.1f %.1f]\n", left, bottom, right, top];
-                }
-                break;
-            }
-            default: {
-                [info appendFormat:@"  /Type /Unknown\n"];
-                [info appendFormat:@"  /ObjectType %d\n", objType];
-                break;
-            }
-        }
-        
-        [info appendFormat:@">>\n"];
-        [info appendFormat:@"endobj\n\n"];
+        PdfiumEx_ReleaseObjectTree(object_tree);
     }
+
     
     FPDF_ClosePage(page);
     
     // 更新文本视图
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.inspectorTextView.string = info;
+        [self.inspectorTextView.textStorage setAttributedString:attributedInfo];
         NSLog(@"[Inspector] 检查器内容已更新，页面 %d", currentPage + 1);
     });
 }
