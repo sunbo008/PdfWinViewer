@@ -16,6 +16,12 @@
 #include <vector>
 #include <string>
 
+// ================= 界面布局常量 =================
+static const CGFloat kBookmarkCollapsedWidth = 20.0;
+static const CGFloat kBookmarkExpandedWidth = 260.0;
+static const CGFloat kInspectorWidth = 300.0;
+static const CGFloat kControlBarHeight = 30.0;
+
 // ================= 日志子系统（与 Windows 对齐） =================
 #if !defined(PDFWV_ENABLE_LOGGING)
 #define PDFWV_ENABLE_LOGGING 0
@@ -1135,9 +1141,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self.split setVertical:YES]; // 左右分栏：左侧书签，右侧内容
 
     // 创建左侧面板（包含顶部控制栏和书签区域）
-    CGFloat collapsedWidth = 20; // 收起状态只显示三角形按钮的宽度
-    CGFloat expandedWidth = 260; // 展开状态的完整宽度
-    CGFloat initialWidth = collapsedWidth; // 默认收起状态
+    CGFloat initialWidth = kBookmarkCollapsedWidth; // 默认收起状态
     self.leftPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, initialWidth, self.mainContentView.bounds.size.height)];
     
     // 创建右侧面板（包含PDF内容和检查器面板）
@@ -1152,7 +1156,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self createBookmarkControlBar];
     
     // Outline（书签区域，位于控制栏下方，初始时隐藏）
-    NSRect outlineFrame = NSMakeRect(0, 0, 260, self.leftPanel.bounds.size.height - 30); // 控制栏下方，高度减去控制栏高度
+    // 使用kBookmarkExpandedWidth作为outline的宽度，确保宽度匹配
+    NSRect outlineFrame = NSMakeRect(0, 0, kBookmarkExpandedWidth, self.leftPanel.bounds.size.height - kControlBarHeight); // 控制栏下方，高度减去控制栏高度
     self.outline = [[NSOutlineView alloc] initWithFrame:outlineFrame];
     NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:@"toc"];
     col.title = @"书签";
@@ -1167,6 +1172,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.outlineScroll = [[NSScrollView alloc] initWithFrame:outlineFrame];
     self.outlineScroll.documentView = self.outline;
     self.outlineScroll.hasVerticalScroller = YES;
+    self.outlineScroll.hasHorizontalScroller = YES; // 添加水平滚动条
+    self.outlineScroll.autohidesScrollers = YES; // 自动隐藏滚动条
     self.outlineScroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.outlineScroll.hidden = YES; // 默认隐藏
     [self.leftPanel addSubview:self.outlineScroll];
@@ -1181,8 +1188,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [rightSplit setVertical:YES]; // 左右分栏：左侧PDF内容，右侧检查器
     
     // 创建PDF内容视图容器
-    CGFloat inspectorWidth = 300; // 检查器面板宽度
-    CGFloat pdfContentWidth = self.rightPanel.bounds.size.width - (self.inspectorVisible ? inspectorWidth : 20);
+    CGFloat pdfContentWidth = self.rightPanel.bounds.size.width - (self.inspectorVisible ? kInspectorWidth : kBookmarkCollapsedWidth);
     self.pdfContentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, pdfContentWidth, self.rightPanel.bounds.size.height)];
     
     // 创建PDF视图
@@ -1197,8 +1203,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self.pdfContentView addSubview:scroll];
     
     // 添加检查器展开/收起按钮到PDF内容视图
-    CGFloat buttonWidth = 20;
-    CGFloat buttonHeight = 30;
+    CGFloat buttonWidth = kBookmarkCollapsedWidth;
+    CGFloat buttonHeight = kControlBarHeight;
     CGFloat buttonY = (self.pdfContentView.bounds.size.height - buttonHeight) / 2;
     self.inspectorToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(self.pdfContentView.bounds.size.width - buttonWidth, buttonY, buttonWidth, buttonHeight)];
     self.inspectorToggleButton.title = @"▶";
@@ -1215,7 +1221,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [rightSplit addSubview:self.inspectorPanel];
     
     // 设置初始分割位置（检查器默认收起，只显示按钮宽度）
-    [rightSplit setPosition:self.rightPanel.bounds.size.width - 20 ofDividerAtIndex:0];
+    [rightSplit setPosition:self.rightPanel.bounds.size.width - kBookmarkCollapsedWidth ofDividerAtIndex:0];
     
     [self.rightPanel addSubview:rightSplit];
 
@@ -1658,9 +1664,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 - (void)createBookmarkControlBar {
     NSLog(@"[BookmarkControl] 开始创建书签控制栏");
     
-    // 创建控制栏容器（只在收起状态下可见，固定宽度20px）
-    CGFloat collapsedWidth = 20;
-    self.bookmarkControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, collapsedWidth, self.leftPanel.bounds.size.height)];
+    // 创建控制栏容器（只在收起状态下可见）
+    self.bookmarkControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kBookmarkCollapsedWidth, self.leftPanel.bounds.size.height)];
     self.bookmarkControlBar.wantsLayer = YES;
     self.bookmarkControlBar.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
     self.bookmarkControlBar.autoresizingMask = NSViewHeightSizable; // 只允许高度自适应，宽度固定
@@ -1694,10 +1699,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.bookmarkVisible = visible;
     NSLog(@"[BookmarkControl] 设置书签可见性: %@", visible ? @"显示" : @"隐藏");
     
-    // 计算新的宽度
-    CGFloat collapsedWidth = 20;
-    CGFloat expandedWidth = 260;
-    CGFloat newWidth = visible ? expandedWidth : collapsedWidth;
+    // 计算新的宽度 - 使用常量确保一致性
+    CGFloat newWidth = visible ? kBookmarkExpandedWidth : kBookmarkCollapsedWidth;
     
     if (animated) {
         // 如果要展开，先创建展开状态的控件
@@ -1911,9 +1914,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self.bookmarkControlBar removeFromSuperview]; // 临时从视图层次中移除
     
     // 创建顶部控制栏（包含标题、+/-按钮）
-    CGFloat controlBarHeight = 30;
-    CGFloat expandedWidth = 260; // 使用展开状态的固定宽度
-    self.expandedTopControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.leftPanel.bounds.size.height - controlBarHeight, expandedWidth, controlBarHeight)];
+    CGFloat expandedWidth = self.leftPanel.bounds.size.width; // 使用当前左侧面板的实际宽度
+    self.expandedTopControlBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.leftPanel.bounds.size.height - kControlBarHeight, expandedWidth, kControlBarHeight)];
     self.expandedTopControlBar.wantsLayer = YES;
     self.expandedTopControlBar.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
     
@@ -1958,7 +1960,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     CGFloat buttonWidth = 16;
     CGFloat buttonHeight = 16;
     CGFloat rightMargin = 4;
-    CGFloat yCenter = (controlBarHeight - buttonHeight) / 2;
+    CGFloat yCenter = (kControlBarHeight - buttonHeight) / 2;
     CGFloat buttonX = self.expandedTopControlBar.bounds.size.width - buttonWidth - rightMargin;
     NSButton* collapseButton = [[NSButton alloc] initWithFrame:NSMakeRect(buttonX, yCenter, buttonWidth, buttonHeight)];
     collapseButton.title = @"◀"; // 左箭头表示可以收起
@@ -2111,13 +2113,12 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     NSLog(@"[Inspector] 开始创建检查器面板");
     
     // 创建检查器面板容器
-    CGFloat inspectorWidth = 300;
-    self.inspectorPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, inspectorWidth, self.rightPanel.bounds.size.height)];
+    self.inspectorPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kInspectorWidth, self.rightPanel.bounds.size.height)];
     self.inspectorPanel.wantsLayer = YES;
     self.inspectorPanel.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
     
     // 添加标题栏
-    NSView* titleBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.inspectorPanel.bounds.size.height - 30, inspectorWidth, 30)];
+    NSView* titleBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.inspectorPanel.bounds.size.height - kControlBarHeight, kInspectorWidth, kControlBarHeight)];
     titleBar.wantsLayer = YES;
     titleBar.layer.backgroundColor = [[NSColor windowBackgroundColor] CGColor];
     titleBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
@@ -2134,7 +2135,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [titleBar addSubview:titleLabel];
     
     // 添加收起按钮
-    NSButton* collapseButton = [[NSButton alloc] initWithFrame:NSMakeRect(inspectorWidth - 30, 5, 20, 20)];
+    NSButton* collapseButton = [[NSButton alloc] initWithFrame:NSMakeRect(kInspectorWidth - 30, 5, 20, 20)];
     collapseButton.title = @"◀";
     collapseButton.font = [NSFont systemFontOfSize:10];
     collapseButton.bordered = NO;
@@ -2144,7 +2145,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [titleBar addSubview:collapseButton];
     
     // 添加底部分隔线
-    NSView* separator = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, inspectorWidth, 1)];
+    NSView* separator = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kInspectorWidth, 1)];
     separator.wantsLayer = YES;
     separator.layer.backgroundColor = [[NSColor separatorColor] CGColor];
     separator.autoresizingMask = NSViewWidthSizable;
@@ -2153,7 +2154,7 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self.inspectorPanel addSubview:titleBar];
     
     // 创建文本视图用于显示页面信息
-    NSRect textFrame = NSMakeRect(0, 0, inspectorWidth, self.inspectorPanel.bounds.size.height - 30);
+    NSRect textFrame = NSMakeRect(0, 0, kInspectorWidth, self.inspectorPanel.bounds.size.height - kControlBarHeight);
     self.inspectorTextView = [[NSTextView alloc] initWithFrame:textFrame];
     self.inspectorTextView.editable = NO;
     self.inspectorTextView.selectable = YES;
@@ -2191,11 +2192,9 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     if (![rightSplit isKindOfClass:[NSSplitView class]]) return;
     
     // 计算新的分割位置
-    CGFloat inspectorWidth = 300;
-    CGFloat collapsedWidth = 20;
     CGFloat newPosition = visible ? 
-        (self.rightPanel.bounds.size.width - inspectorWidth) : 
-        (self.rightPanel.bounds.size.width - collapsedWidth);
+        (self.rightPanel.bounds.size.width - kInspectorWidth) : 
+        (self.rightPanel.bounds.size.width - kBookmarkCollapsedWidth);
     
     if (animated) {
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
