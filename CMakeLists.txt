@@ -41,6 +41,7 @@ if (WIN32)
   )
 elseif(APPLE)
   add_executable(PdfWinViewer MACOSX_BUNDLE
+    platform/shared/pdf_utils.cpp
     platform/mac/App.mm
   )
 endif()
@@ -49,6 +50,9 @@ endif()
 option(PDFWV_ENABLE_LOGGING "Enable in-app logging" OFF)
 if (WIN32)
   target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX PDFWV_ENABLE_LOGGING=$<IF:$<CONFIG:Debug>,1,$<BOOL:${PDFWV_ENABLE_LOGGING}>>)
+elseif(APPLE)
+  # macOS 也携带同名开关：Debug 默认 1，Release 依据 CMake 选项
+  target_compile_definitions(PdfWinViewer PRIVATE PDFWV_ENABLE_LOGGING=$<IF:$<CONFIG:Debug>,1,$<BOOL:${PDFWV_ENABLE_LOGGING}>>)
 endif()
 
 target_include_directories(PdfWinViewer PRIVATE
@@ -83,8 +87,7 @@ elseif(APPLE)
   endif()
   # partition_alloc 在 macOS 需要 Security.framework 以检测 MAP_JIT 权限
   target_link_libraries(PdfWinViewer PRIVATE "-framework Security")
-  # 追加系统 C++ 运行库
-  target_link_libraries(PdfWinViewer PRIVATE c++ c++abi)
+  # 系统 C++ 运行库由工具链/SDK 自动链接，避免重复库告警
   target_link_libraries(PdfWinViewer PRIVATE
     "-framework Cocoa"
     "-framework AppKit"

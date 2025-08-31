@@ -7,10 +7,268 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <fpdfview.h>
 #include <fpdf_text.h>
+#include <fpdf_edit.h>
+#include "../shared/pdf_utils.h"
 #include <fpdf_doc.h>
+#include <mach/mach.h>
+#include <vector>
+#include <string>
 #include <vector>
 #include <string>
 
+// ================= 日志子系统（与 Windows 对齐） =================
+#if !defined(PDFWV_ENABLE_LOGGING)
+#define PDFWV_ENABLE_LOGGING 0
+#endif
+
+enum class LogLevel { Critical, Error, Warning, Debug, Trace };
+
+static inline double NowSeconds() {
+    static double sStart = 0.0;
+    double t = CFAbsoluteTimeGetCurrent();
+    if (sStart == 0.0) sStart = t;
+    return t - sStart;
+}
+
+static inline double GetProcessMemMB() {
+    task_vm_info_data_t info{}; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count);
+    if (kr == KERN_SUCCESS) {
+        return (double)info.phys_footprint / (1024.0 * 1024.0);
+    }
+    mach_task_basic_info_data_t b{}; mach_msg_type_number_t cb = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&b, &cb) == KERN_SUCCESS) {
+        return (double)b.resident_size / (1024.0 * 1024.0);
+    }
+    return 0.0;
+}
+
+// 将 wchar_t* 安全转换为 NSString（兼容 macOS 上 4 字节 wchar_t）
+static inline NSString* NSStringFromWChar(const wchar_t* ws) {
+    if (!ws) return @"";
+    size_t len = wcslen(ws);
+    if (len == 0) return @"";
+    CFStringRef cfs = nullptr;
+    if (sizeof(wchar_t) == 4) {
+        cfs = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8*)ws, (CFIndex)(len * 4), kCFStringEncodingUTF32LE, false);
+    } else {
+        cfs = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8*)ws, (CFIndex)(len * 2), kCFStringEncodingUTF16LE, false);
+    }
+    return CFBridgingRelease(cfs);
+}
+
+// 提前定义全局日志窗口指针，供窗口委托关闭时访问
+@class _LogWindowController;
+static _LogWindowController* _gLogCtrl = nil;
+
+@interface _LogWindowController : NSWindowController <NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate>
+@property(nonatomic, strong) NSButton* enableButton;
+@property(nonatomic, strong) NSButton* clearButton;
+@property(nonatomic, strong) NSTableView* table;
+@property(nonatomic, strong) NSMutableArray<NSDictionary*>* rows;
+@property(nonatomic, strong) NSPopUpButton* filter;
+// NSWindowDelegate
+- (void)windowWillClose:(NSNotification *)notification;
+@end
+
+// 前向声明内部日志开关函数，避免在方法体里临时 extern 声明
+static bool MacLog_IsEnabled();
+static void MacLog_SetEnabled(bool on);
+
+@implementation _LogWindowController
+- (instancetype)init {
+    NSRect rc = NSMakeRect(200, 200, 900, 600);
+    NSWindow* w = [[NSWindow alloc] initWithContentRect:rc
+                                              styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+                                                backing:NSBackingStoreBuffered defer:NO];
+    if (self = [super initWithWindow:w]) {
+        w.delegate = (id<NSWindowDelegate>)self;
+        self.rows = [NSMutableArray new];
+        NSView* c = w.contentView;
+        NSButton* en = [NSButton checkboxWithTitle:@"Enable logging" target:self action:@selector(onToggle:)];
+        en.frame = NSMakeRect(12, rc.size.height-36, 140, 24);
+        [c addSubview:en];
+        self.enableButton = en;
+        NSButton* cl = [NSButton buttonWithTitle:@"Clear" target:self action:@selector(onClear:)];
+        cl.frame = NSMakeRect(160, rc.size.height-36, 80, 24);
+        [c addSubview:cl];
+        self.clearButton = cl;
+        // 过滤按钮
+        NSPopUpButton* filt = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(250, rc.size.height-36, 160, 24) pullsDown:NO];
+        [filt addItemsWithTitles:@[@"All", @"Debug", @"Perf"]];
+        [filt setTarget:self]; [filt setAction:@selector(onFilter:)];
+        [c addSubview:filt];
+        _filter = filt;
+
+        NSScrollView* sv = [[NSScrollView alloc] initWithFrame:NSMakeRect(8, 8, rc.size.width-16, rc.size.height-56)];
+        sv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        NSTableView* tv = [[NSTableView alloc] initWithFrame:sv.bounds];
+        tv.usesAlternatingRowBackgroundColors = YES;
+        tv.delegate = self; tv.dataSource = self;
+        auto addCol = ^(NSString* idt, NSString* title, CGFloat w){ NSTableColumn* col = [[NSTableColumn alloc] initWithIdentifier:idt]; col.title = title; col.width = w; [tv addTableColumn:col]; };
+        addCol(@"Elapsed", @"Elapsed", 110);
+        addCol(@"Level", @"LVL:描述", 120);
+        addCol(@"Page", @"page", 56);
+        addCol(@"Zoom", @"zoom", 64);
+        addCol(@"Time", @"time(ms)", 80);
+        addCol(@"Mem", @"mem(MB)", 80);
+        addCol(@"DMem", @"Δmem(MB)", 90);
+        addCol(@"Remarks", @"Remarks", 420);
+        sv.documentView = tv; sv.hasVerticalScroller = YES; sv.hasHorizontalScroller = YES;
+        [c addSubview:sv];
+        self.table = tv;
+    }
+    return self;
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    if (_filter.indexOfSelectedItem == 0) return (NSInteger)self.rows.count;
+    NSString* key = (_filter.indexOfSelectedItem == 1) ? @"Debug:跟踪" : @"Debug:渲染性能";
+    __block NSInteger cnt = 0;
+    [self.rows enumerateObjectsUsingBlock:^(NSDictionary* _Nonnull d, NSUInteger idx, BOOL * _Nonnull stop){ if ([d[@"Level"] isEqualToString:key]) ++cnt; }];
+    return cnt;
+}
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+    NSTableCellView* cell = [tableView makeViewWithIdentifier:tableColumn.identifier owner:self];
+    if (!cell) { cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0,0,tableColumn.width,20)]; cell.identifier = tableColumn.identifier; NSTextField* tf = [[NSTextField alloc] initWithFrame:cell.bounds]; tf.bezeled = NO; tf.drawsBackground = NO; tf.editable = NO; tf.selectable = NO; tf.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable; cell.textField = tf; [cell addSubview:tf]; }
+    // 简单过滤：重新选择时 table 会刷新，这里按顺序取匹配项
+    NSDictionary* d = nil;
+    if (_filter.indexOfSelectedItem == 0) {
+        d = self.rows[(NSUInteger)row];
+    } else {
+        NSString* key = (_filter.indexOfSelectedItem == 1) ? @"Debug:跟踪" : @"Debug:渲染性能";
+        NSInteger idx = -1;
+        for (NSDictionary* it in self.rows) { if ([it[@"Level"] isEqualToString:key]) { ++idx; if (idx == row) { d = it; break; } } }
+        if (!d) d = @{};
+    }
+    cell.textField.stringValue = d[tableColumn.identifier] ?: @"";
+    return cell;
+}
+
+- (void)appendRow:(NSDictionary*)row {
+    [self.rows addObject:row];
+    [self.table reloadData];
+    NSInteger last = (NSInteger)self.rows.count - 1;
+    if (last >= 0) [self.table scrollRowToVisible:last];
+}
+
+- (void)onToggle:(id)sender { MacLog_SetEnabled(self.enableButton.state == NSControlStateValueOn); }
+- (void)onClear:(id)sender { [self.rows removeAllObjects]; [self.table reloadData]; }
+- (void)onFilter:(id)sender { [self.table reloadData]; }
+// 关闭窗口即停止日志并释放控制器
+- (void)windowWillClose:(NSNotification *)notification {
+    MacLog_SetEnabled(false);
+    _gLogCtrl = nil;
+}
+@end
+
+// 默认不启用日志，直到用户点击“日志”
+static bool& _LogEnabledRef() { static bool e = false; return e; }
+
+static bool MacLog_IsEnabled() { return _LogEnabledRef(); }
+static void MacLog_SetEnabled(bool on) { _LogEnabledRef() = on; }
+static inline void MacLog_ShowWindow() { if (!_gLogCtrl) { _gLogCtrl = [_LogWindowController new]; } [_gLogCtrl showWindow:nil]; _gLogCtrl.enableButton.state = MacLog_IsEnabled()?NSControlStateValueOn:NSControlStateValueOff; }
+
+static inline NSString* WFormat(const wchar_t* fmt, va_list ap) {
+    wchar_t buf[1200]; vswprintf(buf, 1199, fmt, ap); buf[1199]=0; return [[NSString alloc] initWithCharacters:(const unichar*)buf length:wcslen(buf)];
+}
+
+static inline NSString* ToNSString(double v, int prec) { return [NSString stringWithFormat:(prec>=0? [NSString stringWithFormat:@"%%.%df",prec] : @"%f"), v]; }
+static inline NSString* ToNSStringI(int v) { return [NSString stringWithFormat:@"%d", v]; }
+
+static double _lastMemMB = 0.0;
+static double _openStartSec = 0.0; static bool _firstRenderAfterOpen = false;
+// 文件日志：路径与句柄
+static NSString* MacLog_FilePath() {
+    NSString* exec = [[NSBundle mainBundle] executablePath];
+    NSString* dir = [exec stringByDeletingLastPathComponent];
+    return [dir stringByAppendingPathComponent:@"debug.log"];
+}
+static void MacLog_ResetFileOnStartup() {
+    NSString* path = MacLog_FilePath();
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+static void MacLog_AppendLine(NSString* line) {
+    if (!line) return;
+    NSString* s = [line stringByAppendingString:@"\n"];
+    NSData* data = [s dataUsingEncoding:NSUTF8StringEncoding];
+    NSFileHandle* fh = [NSFileHandle fileHandleForWritingAtPath:MacLog_FilePath()];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:MacLog_FilePath() contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:MacLog_FilePath()];
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:data];
+    [fh closeFile];
+}
+static void MacLog_DebugNS(NSString* msg) { if (!msg) return; MacLog_AppendLine([@"[DBG] " stringByAppendingString:msg]); }
+
+static void Log_WriteF(LogLevel lv, const wchar_t* fmt, ...) {
+#if PDFWV_ENABLE_LOGGING
+    if (!MacLog_IsEnabled()) return;
+    va_list ap; va_start(ap, fmt); NSString* msg = WFormat(fmt, ap); va_end(ap);
+    double el = NowSeconds();
+    MacLog_AppendLine([NSString stringWithFormat:@"[DBG] [+%7.3fs] %@", el, msg?:@""]);
+    if (_gLogCtrl) {
+    NSDictionary* row = @{ @"Elapsed": [NSString stringWithFormat:@"%7.3f s", el],
+                           @"Level":   @"Debug:跟踪",
+                           @"Page":    @"",
+                           @"Zoom":    @"",
+                           @"Time":    @"",
+                           @"Mem":     @"",
+                           @"DMem":    @"",
+                           @"Remarks": msg ?: @"" };
+    [_gLogCtrl appendRow:row];
+    }
+#else
+    (void)lv; (void)fmt;
+#endif
+}
+
+static void Log_WritePerfEx(int page, double zoomPct, double timeMs, double memMB, double deltaMB, const wchar_t* remarks, const char* file, int line, const char* func) {
+#if PDFWV_ENABLE_LOGGING
+    if (!MacLog_IsEnabled()) return;
+    double el = NowSeconds();
+    NSString* lvl = @"Debug:渲染性能";
+    NSString* zoom = [NSString stringWithFormat:@"%.0f%%", zoomPct];
+    NSString* tms = ToNSString(timeMs, 2);
+    NSString* mem = ToNSString(memMB, 2);
+    NSString* dmem = ToNSString(deltaMB, 2);
+    NSString* src = [NSString stringWithFormat:@"%s:%d %s", file?file:"", line, func?func:""];
+    NSString* rem = [NSString stringWithFormat:@"%@%@%s", NSStringFromWChar(remarks), (remarks&&remarks[0]?@" | ":@""), src.UTF8String];
+    MacLog_AppendLine([NSString stringWithFormat:@"[PERF] [+%7.3fs] p=%d z=%@ t=%@ mem=%@ dmem=%@ | %@", el, page, zoom, tms, mem, dmem, rem]);
+    if (_gLogCtrl) {
+    NSDictionary* row = @{ @"Elapsed": [NSString stringWithFormat:@"%7.3f s", el],
+                           @"Level":   lvl,
+                           @"Page":    ToNSStringI(page),
+                           @"Zoom":    zoom,
+                           @"Time":    tms,
+                           @"Mem":     mem,
+                           @"DMem":    dmem,
+                           @"Remarks": rem };
+    [_gLogCtrl appendRow:row];
+    }
+#else
+    (void)page; (void)zoomPct; (void)timeMs; (void)memMB; (void)deltaMB; (void)remarks; (void)file; (void)line; (void)func;
+#endif
+}
+
+static void Log_WritePerf(int page, double zoomPct, double timeMs, double memMB, double deltaMB) {
+    Log_WritePerfEx(page, zoomPct, timeMs, memMB, deltaMB, L"渲染单页统计", __FILE__, __LINE__, __FUNCTION__);
+}
+
+#if PDFWV_ENABLE_LOGGING
+  #define LOGF(lv, fmt, ...) do { if (MacLog_IsEnabled()) Log_WriteF((lv), L##fmt, ##__VA_ARGS__); } while(0)
+  #define LOGM(lv, msg)      do { if (MacLog_IsEnabled()) Log_WriteF((lv), L"%s", L##msg); } while(0)
+#else
+  #define LOGF(...) do{}while(0)
+  #define LOGM(...) do{}while(0)
+#endif
+
+static inline void Log_ShowWindow() { MacLog_ShowWindow(); }
+
+// ================= PDFium 错误辅助 =================
 static inline void LogFPDFLastError(const char* where) {
     unsigned long code = FPDF_GetLastError();
     const char* msg = "Unknown";
@@ -49,7 +307,31 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     bool _selecting;
     NSPoint _selStart;
     NSPoint _selEnd;
+    NSPoint _lastContextPt; // 最近一次右键菜单触发位置（视图坐标）
+    BOOL _lastContextHitImage; // 最近一次右键是否命中图片
 }
+- (NSPoint)toPagePxFromView:(NSPoint)viewPt {
+    // Convert view coordinates to page coordinates (in points)
+    // This should match the coordinate system used in rendering
+    double wpt = 0, hpt = 0; 
+    FPDF_GetPageSizeByIndex(_doc, _pageIndex, &wpt, &hpt);
+    
+    // Convert view pixels to page points
+    // The view shows the page at _zoom scale
+    double px = viewPt.x / _zoom;
+    double py = viewPt.y / _zoom;
+    
+    // Note: PdfHitImageAt will handle the Y-axis flip from top-left to bottom-left
+    return NSMakePoint(px, py);
+}
+
+- (NSPoint)toViewFromPagePx:(NSPoint)pagePt {
+    // Convert page coordinates back to view coordinates for debugging
+    double vx = pagePt.x * _zoom;
+    double vy = pagePt.y * _zoom;
+    return NSMakePoint(vx, vy);
+}
+
 - (FPDF_DOCUMENT)document { return _doc; }
 - (void)goToPage:(int)index { if (!_doc) return; int pc = FPDF_GetPageCount(_doc); if (pc>0){ if (index<0) index=0; if(index>=pc) index=pc-1; _pageIndex=index; [self setNeedsDisplay:YES]; } }
 
@@ -78,6 +360,10 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     }
     int pc = FPDF_GetPageCount(_doc);
     NSLog(@"[PdfWinViewer] document loaded. pageCount=%d", pc);
+    // 首次渲染计时起点（仅当日志已启用并且窗口已创建时，避免无谓开销）
+    #if PDFWV_ENABLE_LOGGING
+    if (MacLog_IsEnabled() && _gLogCtrl) { _openStartSec = NowSeconds(); _firstRenderAfterOpen = true; _lastMemMB = GetProcessMemMB(); }
+    #endif
     [self updateViewSizeToFitPage];
     [self setNeedsDisplay:YES];
     return YES;
@@ -163,7 +449,10 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 
     FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
     if (!page) { LogFPDFLastError("FPDF_LoadPage"); return; }
-
+    #if PDFWV_ENABLE_LOGGING
+    bool _logActive = (MacLog_IsEnabled() && _gLogCtrl);
+    double t0 = _logActive ? NowSeconds() : 0.0;
+    #endif
     double wpt = 0, hpt = 0; FPDF_GetPageSizeByIndex(_doc, _pageIndex, &wpt, &hpt);
     // 使用 Retina 比例计算像素，确保 1:1 像素映射，避免缩放导致的模糊
     double scale = [[self window] backingScaleFactor] ?: 1.0;
@@ -211,6 +500,21 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
         NSFrameRectWithWidth(sel, 1.0);
     }
     FPDF_ClosePage(page);
+    #if PDFWV_ENABLE_LOGGING
+    if (_logActive) {
+        double t1 = NowSeconds();
+        double ms = (t1 - t0) * 1000.0;
+        double curMB = GetProcessMemMB();
+        double dMB = curMB - _lastMemMB; _lastMemMB = curMB;
+        if (_firstRenderAfterOpen) {
+            double openMs = (t1 - _openStartSec) * 1000.0;
+            Log_WritePerfEx(_pageIndex+1, _zoom*100.0, openMs, curMB, dMB, L"打开PDF→首次渲染", __FILE__, __LINE__, __FUNCTION__);
+            _firstRenderAfterOpen = false;
+        } else {
+            Log_WritePerf(_pageIndex+1, _zoom*100.0, ms, curMB, dMB);
+        }
+    }
+    #endif
 }
 
 #pragma mark - Mouse events for selection and link navigation
@@ -241,11 +545,82 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
-    if (!_doc) return;
+    if (!_doc) {
+        MacLog_DebugNS(@"[context] blocked: no document");
+        return;
+    }
+    // 记录菜单触发点
+    _lastContextPt = [self convertPoint:event.locationInWindow fromView:nil];
+    MacLog_DebugNS([NSString stringWithFormat:@"[context] raw viewPt=(%.1f,%.1f)", _lastContextPt.x, _lastContextPt.y]);
+    // 判断命中图片
+    NSPoint pt = _lastContextPt;
+    NSPoint pageXY = [self toPagePxFromView:pt];
+    double px = pageXY.x, py = pageXY.y;
+    double wpt = 0, hpt = 0; FPDF_GetPageSizeByIndex(_doc, _pageIndex, &wpt, &hpt);
+    FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
+    MacLog_DebugNS([NSString stringWithFormat:@"[context] pageXY=(%.1f,%.1f) pageIndex=%d", px, py, _pageIndex]);
+    BOOL hitImage = NO; FPDF_PAGEOBJECT hitObj = nullptr; 
+    if (page) { 
+        // 先检查页面上有多少个图片对象
+        int totalObjs = FPDFPage_CountObjects(page);
+        int imageObjs = 0;
+        for (int i = 0; i < totalObjs; i++) {
+            FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+            if (obj && FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_IMAGE) imageObjs++;
+        }
+        MacLog_DebugNS([NSString stringWithFormat:@"[context] page has %d objects, %d images, pageSize=%.1fx%.1f", totalObjs, imageObjs, wpt, hpt]);
+        
+        // 先手动检查前几个图片的边界框
+        int debugCount = 0;
+        for (int i = totalObjs - 1; i >= 0 && debugCount < 3; --i) {
+            FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+            if (obj && FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_IMAGE) {
+                debugCount++;
+                FS_QUADPOINTSF qp{};
+                if (FPDFPageObj_GetRotatedBounds(obj, &qp)) {
+                    float minx = std::min(std::min(qp.x1, qp.x2), std::min(qp.x3, qp.x4));
+                    float maxx = std::max(std::max(qp.x1, qp.x2), std::max(qp.x3, qp.x4));
+                    float miny = std::min(std::min(qp.y1, qp.y2), std::min(qp.y3, qp.y4));
+                    float maxy = std::max(std::max(qp.y1, qp.y2), std::max(qp.y3, qp.y4));
+                    
+                    // 转换为视图坐标系显示（PDF坐标系原点在左下角，视图坐标系原点在左上角）
+                    NSPoint topLeft = [self toViewFromPagePx:NSMakePoint(minx, hpt - maxy)];
+                    NSPoint bottomRight = [self toViewFromPagePx:NSMakePoint(maxx, hpt - miny)];
+                    
+                    MacLog_DebugNS([NSString stringWithFormat:@"[context] coordinate check: hpt=%.1f, PDF_Y_range=%.1f-%.1f, VIEW_Y_range=%.1f-%.1f", hpt, miny, maxy, topLeft.y, bottomRight.y]);
+                    
+                    MacLog_DebugNS([NSString stringWithFormat:@"[context] image %d PDF bounds: (%.1f,%.1f)-(%.1f,%.1f)", debugCount, minx, miny, maxx, maxy]);
+                    MacLog_DebugNS([NSString stringWithFormat:@"[context] image %d VIEW bounds: (%.1f,%.1f)-(%.1f,%.1f)", debugCount, topLeft.x, topLeft.y, bottomRight.x, bottomRight.y]);
+                }
+            }
+        }
+        
+        PdfHitImageResult r = PdfHitImageAt(page, px, py, hpt, 2.0f); 
+        hitObj = r.imageObj; 
+        hitImage = (hitObj != nullptr); 
+        
+        if (hitImage) { 
+            unsigned int iw=0, ih=0; 
+            FPDFImageObj_GetImagePixelSize(hitObj, &iw, &ih); 
+            MacLog_DebugNS([NSString stringWithFormat:@"[context] hit image pixel=%ux%u, bounds=(%.1f,%.1f)-(%.1f,%.1f)", iw, ih, r.minx, r.miny, r.maxx, r.maxy]); 
+        } else {
+            MacLog_DebugNS([NSString stringWithFormat:@"[context] no image hit at PDF coords (%.1f,%.1f)", px, py]);
+        }
+        FPDF_ClosePage(page); 
+    }
+    _lastContextHitImage = hitImage;
+    NSString* ctxLine = [NSString stringWithFormat:@"[context] doc=%@ page=%d view=(%.1f,%.1f) pageXY=(%.1f,%.1f) hitImage=%@", _doc?@"YES":@"NO", _pageIndex, pt.x, pt.y, px, py, hitImage?@"YES":@"NO"];
+    NSLog(@"[PdfWinViewer] %@", ctxLine);
+    MacLog_DebugNS(ctxLine);
     NSMenu* menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO; // 禁用自动启用，手动控制菜单项状态
     [menu addItemWithTitle:@"复制选中文本" action:@selector(copySelectionToPasteboard) keyEquivalent:@""];
     [menu addItem:[NSMenuItem separatorItem]];
-    [menu addItemWithTitle:@"导出当前页 PNG" action:@selector(exportCurrentPagePNG) keyEquivalent:@""];
+    NSMenuItem* expPage = [menu addItemWithTitle:@"导出当前页 PNG" action:@selector(exportCurrentPagePNG) keyEquivalent:@""];
+    expPage.target = self; expPage.enabled = (_doc != nullptr);
+    NSMenuItem* saveImg = [menu addItemWithTitle:@"保存图片…" action:@selector(saveImageAtPoint:) keyEquivalent:@""];
+    saveImg.target = self; saveImg.enabled = hitImage;
+    MacLog_DebugNS([NSString stringWithFormat:@"[context] menu item enabled: %@", hitImage ? @"YES" : @"NO"]);
     [NSMenu popUpContextMenu:menu withEvent:event forView:self];
 }
 
@@ -356,6 +731,7 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
 }
 
 - (BOOL)exportCurrentPagePNG {
+    NSLog(@"[PdfWinViewer][exportPage] doc=%@ page=%d", _doc?@"YES":@"NO", _pageIndex);
     if (!_doc) return NO;
     FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
     if (!page) return NO;
@@ -392,6 +768,138 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     FPDFBitmap_Destroy(bmp);
     FPDF_ClosePage(page);
     return YES;
+}
+
+- (IBAction)saveImageAtPoint:(id)sender {
+    if (!_doc) return;
+    if (!_lastContextHitImage) { MacLog_DebugNS(@"[saveImage] blocked: last context not on image"); return; }
+    NSPoint pt = _lastContextPt; // 使用右键弹出时记录的位置
+    NSPoint pageXY = [self toPagePxFromView:pt];
+    double px = pageXY.x, py = pageXY.y;
+    double wpt = 0, hpt = 0; FPDF_GetPageSizeByIndex(_doc, _pageIndex, &wpt, &hpt);
+    NSLog(@"[PdfWinViewer][saveImage] use pt=(%.1f,%.1f) => pageXY=(%.1f,%.1f) pageWH=(%.1f,%.1f)", pt.x, pt.y, px, py, wpt, hpt);
+    FPDF_PAGE page = FPDF_LoadPage(_doc, _pageIndex);
+    if (!page) return;
+    // 使用共享的 pdf_utils 模块查找命中图片
+    PdfHitImageResult hitResult = PdfHitImageAt(page, px, py, hpt, 2.0f);
+    FPDF_PAGEOBJECT hit = hitResult.imageObj;
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] hit test: obj=%p, bounds=(%.1f,%.1f)-(%.1f,%.1f)", hit, hitResult.minx, hitResult.miny, hitResult.maxx, hitResult.maxy]);
+    if (!hit) { NSLog(@"[PdfWinViewer][saveImage] no image hit"); MacLog_DebugNS(@"[saveImage] no image found at coordinates"); FPDF_ClosePage(page); return; }
+    // 优先原始像素，如失败回退渲染位图（抽到 shared 模块）
+    bool needDestroy=false; 
+    FPDF_BITMAP useBmp = PdfAcquireBitmapForImage(_doc, page, hit, needDestroy);
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] bitmap acquired: %p, needDestroy: %@", useBmp, needDestroy ? @"YES" : @"NO"]);
+    
+    void* buf = nullptr; int w=0,h=0,stride=0; 
+    if (useBmp) { 
+        buf = FPDFBitmap_GetBuffer(useBmp); 
+        w = FPDFBitmap_GetWidth(useBmp); 
+        h = FPDFBitmap_GetHeight(useBmp); 
+        stride = FPDFBitmap_GetStride(useBmp); 
+        MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] bitmap info: %dx%d, stride=%d, buf=%p", w, h, stride, buf]);
+    }
+    if (!buf || w<=0 || h<=0) { 
+        NSLog(@"[PdfWinViewer][saveImage] no bitmap available"); 
+        MacLog_DebugNS(@"[saveImage] bitmap acquisition failed");
+        if (needDestroy && useBmp) FPDFBitmap_Destroy(useBmp);
+        FPDF_ClosePage(page); 
+        return; 
+    }
+    // 保存为 PNG（mac 端采用 ImageIO）
+    NSSavePanel* sp = [NSSavePanel savePanel];
+    [sp setNameFieldStringValue:@"image.png"];
+    NSInteger resp = [sp runModal];
+    NSLog(@"[PdfWinViewer][saveImage] save panel resp=%ld", (long)resp);
+    if (resp != NSModalResponseOK) { if (needDestroy) { /* release rendered */ } FPDF_ClosePage(page); return; }
+    NSURL* url = sp.URL;
+    
+    // 获取 PDFium 位图格式
+    int pdfFormat = FPDFBitmap_GetFormat(useBmp);
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] PDFium format: %d", pdfFormat]);
+    
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = nullptr;
+    
+    // 根据 PDFium 格式设置正确的位图信息
+    CGBitmapInfo bi;
+    int bitsPerComponent = 8;
+    int bitsPerPixel = 32;
+    int finalStride = stride;
+    
+    // BGR 24位格式的转换缓冲区（需要在作用域外保持）
+    static std::vector<unsigned char> rgbBuffer;
+    
+    if (pdfFormat == FPDFBitmap_BGRA) {
+        // BGRA 格式
+        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
+    } else if (pdfFormat == FPDFBitmap_BGRx) {
+        // BGRx 格式（无 alpha）
+        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+        dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
+    } else if (pdfFormat == FPDFBitmap_BGR) {
+        // BGR 24位格式需要特殊处理，转换为 RGB 格式
+        MacLog_DebugNS(@"[saveImage] converting BGR to RGB format");
+        
+        // 创建 RGB 缓冲区
+        rgbBuffer.resize(w * h * 3);
+        const unsigned char* bgrData = (const unsigned char*)buf;
+        
+        // BGR -> RGB 转换
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int bgrIdx = y * stride + x * 3;
+                int rgbIdx = y * w * 3 + x * 3;
+                rgbBuffer[rgbIdx + 0] = bgrData[bgrIdx + 2]; // R = B
+                rgbBuffer[rgbIdx + 1] = bgrData[bgrIdx + 1]; // G = G
+                rgbBuffer[rgbIdx + 2] = bgrData[bgrIdx + 0]; // B = R
+            }
+        }
+        
+        // 更新参数使用 RGB 数据
+        dp = CGDataProviderCreateWithData(NULL, rgbBuffer.data(), rgbBuffer.size(), NULL);
+        bitsPerPixel = 24;
+        bi = (CGBitmapInfo)kCGBitmapByteOrderDefault;
+        finalStride = w * 3; // RGB stride
+        
+        MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] BGR converted to RGB, new stride=%d", finalStride]);
+    } else {
+        // 默认使用 BGRA
+        bi = (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        dp = CGDataProviderCreateWithData(NULL, buf, (size_t)(stride * h), NULL);
+    }
+    
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] using bitsPerPixel=%d, bitmapInfo=0x%x", bitsPerPixel, (unsigned)bi]);
+    
+    CGImageRef img = CGImageCreate(w, h, bitsPerComponent, bitsPerPixel, finalStride, cs, bi, dp, NULL, false, kCGRenderingIntentDefault);
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] CGImage created: %p", img]);
+    CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] destination created: %p, image: %p", dst, img]);
+    
+    bool saveSuccess = false;
+    if (dst && img) { 
+        CGImageDestinationAddImage(dst, img, NULL); 
+        saveSuccess = CGImageDestinationFinalize(dst);
+        MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] finalize result: %@", saveSuccess ? @"SUCCESS" : @"FAILED"]);
+    } else {
+        MacLog_DebugNS(@"[saveImage] missing destination or image");
+    }
+    
+    if (dst) CFRelease(dst); 
+    if (img) CGImageRelease(img); 
+    if (dp) CGDataProviderRelease(dp); 
+    if (cs) CGColorSpaceRelease(cs);
+    
+    // 释放 PDFium 位图
+    if (needDestroy && useBmp) {
+        FPDFBitmap_Destroy(useBmp);
+        MacLog_DebugNS(@"[saveImage] bitmap destroyed");
+    }
+    
+    FPDF_ClosePage(page);
+    
+    NSLog(@"[PdfWinViewer][saveImage] save completed: %@, path: %@", saveSuccess ? @"SUCCESS" : @"FAILED", url.path);
+    MacLog_DebugNS([NSString stringWithFormat:@"[saveImage] final result: %@", saveSuccess ? @"SUCCESS" : @"FAILED"]);
 }
 @end
 
@@ -457,8 +965,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 @property (nonatomic, strong) NSMutableDictionary* settingsDict; // 与 Windows 对齐的 settings.json 容器
 @end
 
-// 前置声明以避免分类方法编译告警
-@interface AppDelegate ()
+// 为在主实现中调用分类方法提供前置声明（命名分类，避免“primary class”重复实现告警）
+@interface AppDelegate (ForwardDecls)
 - (void)loadSettingsJSON;
 - (void)extractRecentFromSettings;
 - (void)rebuildRecentMenu;
@@ -468,6 +976,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    // 启动清空文件日志
+    #if PDFWV_ENABLE_LOGGING
+    MacLog_ResetFileOnStartup();
+    #endif
     NSRect rect = NSMakeRect(200, 200, 1200, 800);
     self.window = [[NSWindow alloc] initWithContentRect:rect
                                               styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
@@ -534,6 +1046,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     openItem.target = self;
     NSMenuItem* exportItem = [fileMenu addItemWithTitle:@"导出当前页为 PNG" action:@selector(exportPNG:) keyEquivalent:@"e"];
     exportItem.target = self;
+    exportItem.tag = 9901; // 用于后续查找
+    [exportItem setEnabled:NO];
     [fileMenu addItem:[NSMenuItem separatorItem]];
     // 最近浏览子菜单
     self.recentMenuItem = [[NSMenuItem alloc] initWithTitle:@"最近浏览" action:nil keyEquivalent:@""];
@@ -576,6 +1090,11 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     nextItem.target = self.view;
     NSMenuItem* gotoItem = [viewMenu addItemWithTitle:@"跳转页…" action:@selector(gotoPage:) keyEquivalent:@"g"];
     gotoItem.target = self.view;
+    [viewMenu addItem:[NSMenuItem separatorItem]];
+    // 日志窗口入口
+    NSMenuItem* logItem = [viewMenu addItemWithTitle:@"日志" action:@selector(openLogWindow:) keyEquivalent:@"l"];
+    logItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+    logItem.target = self;
     [viewItem setSubmenu:viewMenu];
     [mainMenu addItem:viewItem];
 
@@ -593,6 +1112,8 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     [self extractRecentFromSettings];
     NSLog(@"[PdfWinViewer] extracted recent_paths count=%lu from settings", (unsigned long)self.recentPaths.count);
     [self rebuildRecentMenu];
+    // 初始时禁用“导出”
+    NSMenuItem* exp = [fileMenu itemWithTag:9901]; if (exp) [exp setEnabled:NO];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
@@ -653,6 +1174,15 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 
 @implementation AppDelegate (FileActions)
 
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    if (menuItem.action == @selector(exportPNG:)) {
+        BOOL enable = ([self.view document] != nullptr);
+        NSLog(@"[PdfWinViewer][menu] validate exportPNG enable=%@", enable?@"YES":@"NO");
+        return enable;
+    }
+    return YES;
+}
+
 - (IBAction)openDocument:(id)sender {
     NSLog(@"[PdfWinViewer] openDocument clicked");
     [NSApp activateIgnoringOtherApps:YES];
@@ -673,8 +1203,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 }
 
 - (IBAction)exportPNG:(id)sender {
-    [self.view exportCurrentPagePNG];
+    if ([self.view document]) { [self.view exportCurrentPagePNG]; }
 }
+
+- (IBAction)openLogWindow:(id)sender { MacLog_SetEnabled(true); Log_ShowWindow(); }
 
 @end
 
@@ -752,6 +1284,9 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
         // 写入最近
         [self addRecentPath:path];
         NSLog(@"[PdfWinViewer] after addRecentPath, recent count=%lu", (unsigned long)self.recentPaths.count);
+        // 启用“导出当前页为 PNG”
+        NSMenu* fileMenu = [[[NSApp mainMenu] itemWithTitle:@"文件"] submenu];
+        NSMenuItem* exp = [fileMenu itemWithTag:9901]; if (exp) [exp setEnabled:YES];
     } else {
         NSAlert* alert = [NSAlert new];
         alert.messageText = @"无法打开 PDF";

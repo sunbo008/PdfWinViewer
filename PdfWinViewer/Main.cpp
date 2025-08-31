@@ -22,6 +22,7 @@
 #include <fpdf_formfill.h>
 #include <fpdf_edit.h>
 #include <fpdf_text.h>
+#include "../platform/shared/pdf_utils.h"
 
 // 直接使用公共头中的 API：FPDFDest_GetDestPageIndex
 
@@ -1298,22 +1299,9 @@ static void CollectImagesRecursive(FPDF_PAGE page, FPDF_PAGEOBJECT obj, const FS
 	}
 }
 static FPDF_PAGEOBJECT FindImageAtPoint(FPDF_PAGE page, double pageX, double pageY, double pageHeight) {
-	// 直接使用对象的旋转边界在页坐标命中，避免递归误差
-	int count = FPDFPage_CountObjects(page);
-	float px = (float)pageX; float py = (float)(pageHeight - pageY); // PDF 坐标 y 向上
-	const float eps = 2.0f; // 2px 容差
-	for (int i = count - 1; i >= 0; --i) { // 从上往下，优先显示在上的对象
-		FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
-		if (!obj) continue;
-		if (FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
-		FS_QUADPOINTSF qp{}; if (!FPDFPageObj_GetRotatedBounds(obj, &qp)) continue;
-		float minx = std::min(std::min(qp.x1, qp.x2), std::min(qp.x3, qp.x4)) - eps;
-		float maxx = std::max(std::max(qp.x1, qp.x2), std::max(qp.x3, qp.x4)) + eps;
-		float miny = std::min(std::min(qp.y1, qp.y2), std::min(qp.y3, qp.y4)) - eps;
-		float maxy = std::max(std::max(qp.y1, qp.y2), std::max(qp.y3, qp.y4)) + eps;
-		if (px >= minx && px <= maxx && py >= miny && py <= maxy) return obj;
-	}
-	return nullptr;
+	// 使用共享的 pdf_utils 模块进行命中检测
+	PdfHitImageResult result = PdfHitImageAt(page, pageX, pageY, pageHeight);
+	return result.imageObj;
 }
 
 static bool IsPointOverImage(HWND hWnd, POINT clientPt) {
@@ -1397,51 +1385,56 @@ static void ConvertAnyToBGRA(const void* srcBuf, int width, int height, int stri
 static bool SaveImageFromObject(HWND hWnd, FPDF_PAGE page, FPDF_PAGEOBJECT imgObj) {
 	if (!page || !imgObj) return false;
 	EnsureCOM();
-	// 先获取可以保存的位图缓冲；若两种方式都失败，则直接返回，不弹保存框
-	void* buffer = nullptr; int width = 0, height = 0, stride = 0; bool preferJpeg = false; FPDF_BITMAP hold = nullptr;
+	
+	// 使用共享的 pdf_utils 模块获取位图
+	FPDF_BITMAP hold = PdfAcquireBitmapForImage(g_doc, page, imgObj);
+	if (!hold) {
+		// 调试日志：获取位图失败
+		#if PDFWV_ENABLE_LOGGING
+		LOGF(LogLevel::Warning, "Failed to acquire bitmap for image object");
+		#endif
+		return false;
+	}
+	
+	void* buffer = FPDFBitmap_GetBuffer(hold);
+	int width = FPDFBitmap_GetWidth(hold);
+	int height = FPDFBitmap_GetHeight(hold);
+	int stride = FPDFBitmap_GetStride(hold);
+	int fmt = FPDFBitmap_GetFormat(hold);
+	
+	if (!buffer || width <= 0 || height <= 0) {
+		FPDFBitmap_Destroy(hold);
+		#if PDFWV_ENABLE_LOGGING
+		LOGF(LogLevel::Warning, "Invalid bitmap data: buffer=%p, size=%dx%d", buffer, width, height);
+		#endif
+		return false;
+	}
+	
+	// 检查是否为 JPEG 格式
+	bool preferJpeg = false;
 	int nfilters = FPDFImageObj_GetImageFilterCount(imgObj);
-	for (int k = 0; k < nfilters; ++k) { char name[32]{}; if (FPDFImageObj_GetImageFilter(imgObj, k, name, sizeof(name))>0) { if (_stricmp(name, "DCTDecode")==0) { preferJpeg = true; break; } } }
-	// 优先原始像素
-	if (!buffer) {
-		FPDF_BITMAP baseBmp = FPDFImageObj_GetBitmap(imgObj);
-		if (baseBmp) {
-			void* src = FPDFBitmap_GetBuffer(baseBmp);
-			int fmt = FPDFBitmap_GetFormat(baseBmp);
-			width = FPDFBitmap_GetWidth(baseBmp);
-			height = FPDFBitmap_GetHeight(baseBmp);
-			stride = FPDFBitmap_GetStride(baseBmp);
-			static std::vector<unsigned char> convBase; convBase.clear();
-			if (fmt == FPDFBitmap_BGRA || fmt == FPDFBitmap_BGRA_Premul) {
-				buffer = src;
-			} else {
-				ConvertAnyToBGRA(src, width, height, stride, fmt, convBase);
-				buffer = convBase.data();
-				stride = width * 4;
+	for (int k = 0; k < nfilters; ++k) {
+		char name[32]{};
+		if (FPDFImageObj_GetImageFilter(imgObj, k, name, sizeof(name)) > 0) {
+			if (_stricmp(name, "DCTDecode") == 0) {
+				preferJpeg = true;
+				break;
 			}
-			hold = baseBmp;
 		}
 	}
-	// 退回渲染（包含遮罩/矩阵）
-	if (!buffer) {
-		FPDF_BITMAP bmp = FPDFImageObj_GetRenderedBitmap(g_doc, page, imgObj);
-		if (bmp) {
-			void* src = FPDFBitmap_GetBuffer(bmp);
-			int fmt = FPDFBitmap_GetFormat(bmp);
-			width = FPDFBitmap_GetWidth(bmp);
-			height = FPDFBitmap_GetHeight(bmp);
-			stride = FPDFBitmap_GetStride(bmp);
-			static std::vector<unsigned char> convR; convR.clear();
-			if (fmt == FPDFBitmap_BGRA || fmt == FPDFBitmap_BGRA_Premul) {
-				buffer = src;
-			} else {
-				ConvertAnyToBGRA(src, width, height, stride, fmt, convR);
-				buffer = convR.data();
-				stride = width * 4;
-			}
-			hold = bmp;
-		}
+	
+	// 如果不是 BGRA 格式，需要转换
+	static std::vector<unsigned char> convBuffer;
+	if (fmt != FPDFBitmap_BGRA && fmt != FPDFBitmap_BGRA_Premul) {
+		convBuffer.clear();
+		ConvertAnyToBGRA(buffer, width, height, stride, fmt, convBuffer);
+		buffer = convBuffer.data();
+		stride = width * 4;
 	}
-	if (!buffer || width <= 0 || height <= 0) { if (hold) FPDFBitmap_Destroy(hold); return false; }
+	
+	#if PDFWV_ENABLE_LOGGING
+	LOGF(LogLevel::Debug, "Saving image: %dx%d, format=%d, preferJpeg=%s", width, height, fmt, preferJpeg ? "true" : "false");
+	#endif
 	// 仅在确实可以保存时弹一次保存框
 	std::wstring defName = preferJpeg ? L"image.jpg" : L"image.png";
 	std::wstring path = preferJpeg ? SaveDialogWithExt(hWnd, defName.c_str(), L"JPEG Image (*.jpg)\0*.jpg\0\0", L"jpg")
@@ -1943,8 +1936,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
 				double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
 				double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
-				FPDF_PAGEOBJECT obj = FindImageAtPoint(pg, pageX, pageY, h_pt);
-				enableSave = (obj != nullptr);
+				
+				// 使用共享的 pdf_utils 模块进行命中检测
+				PdfHitImageResult hitResult = PdfHitImageAt(pg, pageX, pageY, h_pt);
+				enableSave = (hitResult.imageObj != nullptr);
+				
+				#if PDFWV_ENABLE_LOGGING
+				LOGF(LogLevel::Debug, "Right-click at client(%d,%d) -> page(%.2f,%.2f), hit=%s", 
+					clientPt.x, clientPt.y, pageX, pageY, enableSave ? "image" : "none");
+				#endif
+				
 				FPDF_ClosePage(pg);
 			}
 		}
@@ -1962,13 +1963,35 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			if (g_doc) {
 				if (g_savingImageNow) { return 0; }
 				g_savingImageNow = true;
+				
+				#if PDFWV_ENABLE_LOGGING
+				LOGF(LogLevel::Debug, "Save image triggered at client(%d,%d)", clientPt.x, clientPt.y);
+				#endif
+				
 				FPDF_PAGE pg = FPDF_LoadPage(g_doc, g_page_index);
 				if (pg) {
 					double pageX = (clientPt.x + g_scrollX) * (72.0 / g_dpiX) / g_zoom;
 					double pageY = (clientPt.y + g_scrollY) * (72.0 / g_dpiY) / g_zoom;
 					double w_pt = 0, h_pt = 0; FPDF_GetPageSizeByIndex(g_doc, g_page_index, &w_pt, &h_pt);
-					FPDF_PAGEOBJECT obj = FindImageAtPoint(pg, pageX, pageY, h_pt);
-					if (obj) { SaveImageFromObject(hWnd, pg, obj); }
+					
+					// 使用共享的 pdf_utils 模块进行命中检测
+					PdfHitImageResult hitResult = PdfHitImageAt(pg, pageX, pageY, h_pt);
+					
+					#if PDFWV_ENABLE_LOGGING
+					LOGF(LogLevel::Debug, "Page coords: (%.2f,%.2f), hit result: obj=%p, size=%dx%d", 
+						pageX, pageY, hitResult.imageObj, hitResult.pixelWidth, hitResult.pixelHeight);
+					#endif
+					
+					if (hitResult.imageObj) {
+						bool saved = SaveImageFromObject(hWnd, pg, hitResult.imageObj);
+						#if PDFWV_ENABLE_LOGGING
+						LOGF(LogLevel::Debug, "Save image result: %s", saved ? "success" : "failed");
+						#endif
+					} else {
+						#if PDFWV_ENABLE_LOGGING
+						LOGF(LogLevel::Warning, "No image found at click position");
+						#endif
+					}
 					FPDF_ClosePage(pg);
 				}
 				g_savingImageNow = false;
