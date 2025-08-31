@@ -1413,11 +1413,54 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
         [self updateBookmarkScrollView];
         [self ensureBookmarkScrollBarVisible];
     });
+    
+    // 添加全局键盘事件监听，确保PageUp/PageDown总是控制PDF翻页
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent * _Nullable(NSEvent * _Nonnull event) {
+        return [self handleGlobalKeyDown:event];
+    }];
+    NSLog(@"[GlobalKey] 全局键盘事件监听已设置");
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     FPDF_DestroyLibrary();
     return NSTerminateNow;
+}
+
+#pragma mark - Global Keyboard Event Handling
+
+- (NSEvent*)handleGlobalKeyDown:(NSEvent*)event {
+    NSString* chars = [event charactersIgnoringModifiers];
+    unichar c = chars.length ? [chars characterAtIndex:0] : 0;
+    NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    
+    // 拦截翻页相关的键盘事件，总是路由到PDF视图
+    BOOL isPageNavigationKey = NO;
+    
+    if (c == NSPageUpFunctionKey || c == NSPageDownFunctionKey) {
+        isPageNavigationKey = YES;
+        NSLog(@"[GlobalKey] 拦截到%@键", c == NSPageUpFunctionKey ? @"PageUp" : @"PageDown");
+    } else if (c == NSHomeFunctionKey || c == NSEndFunctionKey) {
+        isPageNavigationKey = YES;
+        NSLog(@"[GlobalKey] 拦截到%@键", c == NSHomeFunctionKey ? @"Home" : @"End");
+    } else if (c == NSUpArrowFunctionKey || c == NSDownArrowFunctionKey) {
+        // 只有在没有修饰键时才拦截箭头键（避免影响其他功能）
+        if (mods == 0) {
+            isPageNavigationKey = YES;
+            NSLog(@"[GlobalKey] 拦截到%@箭头键", c == NSUpArrowFunctionKey ? @"上" : @"下");
+        }
+    }
+    
+    if (isPageNavigationKey) {
+        NSLog(@"[GlobalKey] 路由翻页键到PDF视图");
+        
+        // 直接调用PDF视图的键盘处理
+        if (self.view && [self.view respondsToSelector:@selector(keyDown:)]) {
+            [self.view keyDown:event];
+            return nil; // 消费事件，不再传递
+        }
+    }
+    
+    return event; // 其他键盘事件正常传递
 }
 @end
 
