@@ -805,13 +805,23 @@ static inline std::string NSStringToUTF8(NSObject* obj) {
     [alert addButtonWithTitle:@"OK"]; [alert addButtonWithTitle:@"Cancel"];
     if ([alert runModal] == NSAlertFirstButtonReturn) {
         NSInteger v = tf.integerValue;
-        if (v >= 1 && v <= pc) { 
-            int oldIndex = _pageIndex;
-            _pageIndex = (int)v - 1; 
-            [self setNeedsDisplay:YES]; 
-            if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
-                [self.delegate pdfViewDidChangePage:self];
-            }
+        
+        // 边界检查：确保页码在有效范围内
+        if (v < 1) {
+            v = 1; // 小于最小值时使用最小值
+            NSLog(@"[PageNavigation] 输入页码小于1，调整为最小值: %ld", (long)v);
+        } else if (v > pc) {
+            v = pc; // 大于最大值时使用最大值
+            NSLog(@"[PageNavigation] 输入页码超过最大值%ld，调整为最大值: %ld", (long)pc, (long)v);
+        }
+        
+        int oldIndex = _pageIndex;
+        _pageIndex = (int)v - 1; // 转换为0基索引
+        NSLog(@"[PageNavigation] 设置页码为: %ld (索引: %d)", (long)v, _pageIndex);
+        [self setNeedsDisplay:YES]; 
+        
+        if (oldIndex != _pageIndex && [self.delegate respondsToSelector:@selector(pdfViewDidChangePage:)]) {
+            [self.delegate pdfViewDidChangePage:self];
         }
     }
 }
@@ -2647,13 +2657,20 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     int pageNum = [input intValue];
     int totalPages = FPDF_GetPageCount([self.view document]);
     
-    if (pageNum >= 1 && pageNum <= totalPages) {
-        [self.view goToPage:pageNum - 1]; // 转换为0开始的索引
-        [self updateStatusBar];
-    } else {
-        // 输入无效，恢复当前页码
-        [self updateStatusBar];
+    // 边界检查：确保页码在有效范围内
+    int validPageNum = pageNum;
+    if (pageNum < 1) {
+        validPageNum = 1; // 小于最小值时使用最小值
+        NSLog(@"[PageNavigation] 状态栏输入页码%d小于1，调整为最小值: %d", pageNum, validPageNum);
+    } else if (pageNum > totalPages) {
+        validPageNum = totalPages; // 大于最大值时使用最大值
+        NSLog(@"[PageNavigation] 状态栏输入页码%d超过最大值%d，调整为最大值: %d", pageNum, totalPages, validPageNum);
     }
+    
+    // 应用有效的页码
+    [self.view goToPage:validPageNum - 1]; // 转换为0开始的索引
+    NSLog(@"[PageNavigation] 状态栏页码设置为: %d (索引: %d)", validPageNum, validPageNum - 1);
+    [self updateStatusBar];
 }
 
 #pragma mark - PdfViewDelegate
