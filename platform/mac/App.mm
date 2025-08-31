@@ -1058,6 +1058,15 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 @property (nonatomic, strong) NSView* leftPanel; // 左侧面板（包含控制栏和书签）
 @property (nonatomic, assign) BOOL bookmarkVisible; // 书签是否可见
 @property (nonatomic, strong) NSView* expandedTopControlBar; // 展开状态的顶部控制栏
+
+// 右侧检查器面板相关属性
+@property (nonatomic, strong) NSView* rightPanel; // 右侧面板（包含PDF内容和检查器）
+@property (nonatomic, strong) NSView* pdfContentView; // PDF内容视图容器
+@property (nonatomic, strong) NSView* inspectorPanel; // 检查器面板
+@property (nonatomic, strong) NSButton* inspectorToggleButton; // 检查器展开/收起按钮
+@property (nonatomic, assign) BOOL inspectorVisible; // 检查器是否可见
+@property (nonatomic, strong) NSTextView* inspectorTextView; // 检查器文本视图
+@property (nonatomic, strong) NSScrollView* inspectorScrollView; // 检查器滚动视图
 @end
 
 // 为在主实现中调用分类方法提供前置声明（命名分类，避免"primary class"重复实现告警）
@@ -1083,6 +1092,10 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
 - (BOOL)findParentPathForItem:(TocNode*)targetItem inNode:(TocNode*)currentNode parentPath:(NSMutableArray*)path;
 - (void)createExpandedBookmarkControls;
 - (void)removeExpandedBookmarkControls;
+- (void)createInspectorPanel;
+- (void)toggleInspectorVisibility:(id)sender;
+- (void)setInspectorVisible:(BOOL)visible animated:(BOOL)animated;
+- (void)updateInspectorContent;
 @end
 
 @implementation AppDelegate
@@ -1126,7 +1139,14 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     CGFloat expandedWidth = 260; // 展开状态的完整宽度
     CGFloat initialWidth = collapsedWidth; // 默认收起状态
     self.leftPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, initialWidth, self.mainContentView.bounds.size.height)];
-    NSView* right = [[NSView alloc] initWithFrame:NSMakeRect(initialWidth, 0, self.mainContentView.bounds.size.width-initialWidth, self.mainContentView.bounds.size.height)];
+    
+    // 创建右侧面板（包含PDF内容和检查器面板）
+    CGFloat rightPanelX = initialWidth;
+    CGFloat rightPanelWidth = self.mainContentView.bounds.size.width - initialWidth;
+    self.rightPanel = [[NSView alloc] initWithFrame:NSMakeRect(rightPanelX, 0, rightPanelWidth, self.mainContentView.bounds.size.height)];
+    
+    // 初始化检查器可见性状态（默认收起）
+    self.inspectorVisible = NO;
 
     // 创建书签控制栏（顶部水平布局）
     [self createBookmarkControlBar];
@@ -1151,18 +1171,56 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     self.outlineScroll.hidden = YES; // 默认隐藏
     [self.leftPanel addSubview:self.outlineScroll];
 
+    // 创建检查器面板
+    [self createInspectorPanel];
+    
+    // 在右侧面板内创建PDF内容视图和检查器的分割视图
+    NSSplitView* rightSplit = [[NSSplitView alloc] initWithFrame:self.rightPanel.bounds];
+    rightSplit.dividerStyle = NSSplitViewDividerStyleThin;
+    rightSplit.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [rightSplit setVertical:YES]; // 左右分栏：左侧PDF内容，右侧检查器
+    
+    // 创建PDF内容视图容器
+    CGFloat inspectorWidth = 300; // 检查器面板宽度
+    CGFloat pdfContentWidth = self.rightPanel.bounds.size.width - (self.inspectorVisible ? inspectorWidth : 20);
+    self.pdfContentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, pdfContentWidth, self.rightPanel.bounds.size.height)];
+    
+    // 创建PDF视图
     self.view = [[PdfView alloc] initWithFrame:NSMakeRect(0,0,800,600)];
     self.view.delegate = self;
-    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:right.bounds];
+    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:self.pdfContentView.bounds];
     scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     scroll.hasVerticalScroller = YES;
     scroll.hasHorizontalScroller = YES;
     scroll.borderType = NSNoBorder;
     scroll.documentView = self.view;
-    [right addSubview:scroll];
+    [self.pdfContentView addSubview:scroll];
+    
+    // 添加检查器展开/收起按钮到PDF内容视图
+    CGFloat buttonWidth = 20;
+    CGFloat buttonHeight = 30;
+    CGFloat buttonY = (self.pdfContentView.bounds.size.height - buttonHeight) / 2;
+    self.inspectorToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(self.pdfContentView.bounds.size.width - buttonWidth, buttonY, buttonWidth, buttonHeight)];
+    self.inspectorToggleButton.title = @"▶";
+    self.inspectorToggleButton.font = [NSFont systemFontOfSize:12];
+    self.inspectorToggleButton.bordered = YES;
+    self.inspectorToggleButton.bezelStyle = NSBezelStyleRounded;
+    self.inspectorToggleButton.target = self;
+    self.inspectorToggleButton.action = @selector(toggleInspectorVisibility:);
+    self.inspectorToggleButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin | NSViewMinYMargin;
+    [self.pdfContentView addSubview:self.inspectorToggleButton];
+    
+    // 将PDF内容视图和检查器面板添加到右侧分割视图
+    [rightSplit addSubview:self.pdfContentView];
+    [rightSplit addSubview:self.inspectorPanel];
+    
+    // 设置初始分割位置（检查器默认收起，只显示按钮宽度）
+    [rightSplit setPosition:self.rightPanel.bounds.size.width - 20 ofDividerAtIndex:0];
+    
+    [self.rightPanel addSubview:rightSplit];
 
     [self.split addSubview:self.leftPanel];
-    [self.split addSubview:right];
+    [self.split addSubview:self.rightPanel];
     [self.split setPosition:initialWidth ofDividerAtIndex:0]; // 默认只显示控制栏宽度
     [self.mainContentView addSubview:self.split];
     
@@ -2042,6 +2100,210 @@ static TocNode* BuildBookmarksTree(FPDF_DOCUMENT doc) {
     
     // 高亮当前书签
     [self highlightCurrentBookmark];
+    
+    // 更新检查器内容
+    [self updateInspectorContent];
+}
+
+#pragma mark - 检查器面板相关方法
+
+- (void)createInspectorPanel {
+    NSLog(@"[Inspector] 开始创建检查器面板");
+    
+    // 创建检查器面板容器
+    CGFloat inspectorWidth = 300;
+    self.inspectorPanel = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, inspectorWidth, self.rightPanel.bounds.size.height)];
+    self.inspectorPanel.wantsLayer = YES;
+    self.inspectorPanel.layer.backgroundColor = [[NSColor controlBackgroundColor] CGColor];
+    
+    // 添加标题栏
+    NSView* titleBar = [[NSView alloc] initWithFrame:NSMakeRect(0, self.inspectorPanel.bounds.size.height - 30, inspectorWidth, 30)];
+    titleBar.wantsLayer = YES;
+    titleBar.layer.backgroundColor = [[NSColor windowBackgroundColor] CGColor];
+    titleBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    
+    // 添加标题
+    NSTextField* titleLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(10, 6, 100, 18)];
+    titleLabel.stringValue = @"页面元素";
+    titleLabel.font = [NSFont boldSystemFontOfSize:13];
+    titleLabel.textColor = [NSColor labelColor];
+    titleLabel.backgroundColor = [NSColor clearColor];
+    titleLabel.bordered = NO;
+    titleLabel.editable = NO;
+    titleLabel.selectable = NO;
+    [titleBar addSubview:titleLabel];
+    
+    // 添加收起按钮
+    NSButton* collapseButton = [[NSButton alloc] initWithFrame:NSMakeRect(inspectorWidth - 30, 5, 20, 20)];
+    collapseButton.title = @"◀";
+    collapseButton.font = [NSFont systemFontOfSize:10];
+    collapseButton.bordered = NO;
+    collapseButton.target = self;
+    collapseButton.action = @selector(toggleInspectorVisibility:);
+    collapseButton.autoresizingMask = NSViewMinXMargin;
+    [titleBar addSubview:collapseButton];
+    
+    // 添加底部分隔线
+    NSView* separator = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, inspectorWidth, 1)];
+    separator.wantsLayer = YES;
+    separator.layer.backgroundColor = [[NSColor separatorColor] CGColor];
+    separator.autoresizingMask = NSViewWidthSizable;
+    [titleBar addSubview:separator];
+    
+    [self.inspectorPanel addSubview:titleBar];
+    
+    // 创建文本视图用于显示页面信息
+    NSRect textFrame = NSMakeRect(0, 0, inspectorWidth, self.inspectorPanel.bounds.size.height - 30);
+    self.inspectorTextView = [[NSTextView alloc] initWithFrame:textFrame];
+    self.inspectorTextView.editable = NO;
+    self.inspectorTextView.selectable = YES;
+    self.inspectorTextView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.inspectorTextView.textColor = [NSColor labelColor];
+    self.inspectorTextView.backgroundColor = [NSColor textBackgroundColor];
+    
+    // 创建滚动视图
+    self.inspectorScrollView = [[NSScrollView alloc] initWithFrame:textFrame];
+    self.inspectorScrollView.documentView = self.inspectorTextView;
+    self.inspectorScrollView.hasVerticalScroller = YES;
+    self.inspectorScrollView.hasHorizontalScroller = YES;
+    self.inspectorScrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self.inspectorPanel addSubview:self.inspectorScrollView];
+    
+    NSLog(@"[Inspector] 检查器面板创建完成");
+}
+
+- (void)toggleInspectorVisibility:(id)sender {
+    NSLog(@"[Inspector] 切换检查器可见性，当前状态: %@", self.inspectorVisible ? @"可见" : @"隐藏");
+    [self setInspectorVisible:!self.inspectorVisible animated:YES];
+}
+
+- (void)setInspectorVisible:(BOOL)visible animated:(BOOL)animated {
+    if (self.inspectorVisible == visible) return; // 状态未改变
+    
+    self.inspectorVisible = visible;
+    NSLog(@"[Inspector] 设置检查器可见性: %@", visible ? @"显示" : @"隐藏");
+    
+    // 更新按钮文本
+    self.inspectorToggleButton.title = visible ? @"◀" : @"▶";
+    
+    // 获取右侧分割视图
+    NSSplitView* rightSplit = (NSSplitView*)self.rightPanel.subviews.firstObject;
+    if (![rightSplit isKindOfClass:[NSSplitView class]]) return;
+    
+    // 计算新的分割位置
+    CGFloat inspectorWidth = 300;
+    CGFloat collapsedWidth = 20;
+    CGFloat newPosition = visible ? 
+        (self.rightPanel.bounds.size.width - inspectorWidth) : 
+        (self.rightPanel.bounds.size.width - collapsedWidth);
+    
+    if (animated) {
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+            context.duration = 0.25;
+            context.allowsImplicitAnimation = YES;
+            [rightSplit.animator setPosition:newPosition ofDividerAtIndex:0];
+        } completionHandler:^{
+            NSLog(@"[Inspector] 检查器切换动画完成");
+            if (visible) {
+                [self updateInspectorContent];
+            }
+        }];
+    } else {
+        [rightSplit setPosition:newPosition ofDividerAtIndex:0];
+        if (visible) {
+            [self updateInspectorContent];
+        }
+    }
+}
+
+- (void)updateInspectorContent {
+    if (!self.inspectorVisible || !self.inspectorTextView || !self.view) return;
+    
+    FPDF_DOCUMENT doc = [self.view document];
+    if (!doc) {
+        self.inspectorTextView.string = @"没有打开的PDF文档";
+        return;
+    }
+    
+    int currentPage = [self.view currentPageIndex];
+    int totalPages = FPDF_GetPageCount(doc);
+    
+    // 获取当前页面
+    FPDF_PAGE page = FPDF_LoadPage(doc, currentPage);
+    if (!page) {
+        self.inspectorTextView.string = @"无法加载当前页面";
+        return;
+    }
+    
+    // 获取页面尺寸
+    double pageWidth = FPDF_GetPageWidth(page);
+    double pageHeight = FPDF_GetPageHeight(page);
+    
+    // 获取页面对象数量
+    int objectCount = FPDFPage_CountObjects(page);
+    
+    // 构建信息文本
+    NSMutableString* info = [NSMutableString string];
+    [info appendFormat:@"PDF 文档信息\n"];
+    [info appendFormat:@"================\n\n"];
+    [info appendFormat:@"当前页面: %d / %d\n", currentPage + 1, totalPages];
+    [info appendFormat:@"页面尺寸: %.2f x %.2f pt\n", pageWidth, pageHeight];
+    [info appendFormat:@"页面对象数: %d\n\n", objectCount];
+    
+    [info appendFormat:@"页面对象列表\n"];
+    [info appendFormat:@"================\n"];
+    
+    // 遍历页面对象
+    for (int i = 0; i < objectCount; i++) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+        if (!obj) continue;
+        
+        int objType = FPDFPageObj_GetType(obj);
+        NSString* typeName = @"未知";
+        
+        switch (objType) {
+            case FPDF_PAGEOBJ_TEXT:
+                typeName = @"文本";
+                break;
+            case FPDF_PAGEOBJ_PATH:
+                typeName = @"路径";
+                break;
+            case FPDF_PAGEOBJ_IMAGE:
+                typeName = @"图像";
+                break;
+            case FPDF_PAGEOBJ_SHADING:
+                typeName = @"渐变";
+                break;
+            case FPDF_PAGEOBJ_FORM:
+                typeName = @"表单";
+                break;
+            default:
+                typeName = [NSString stringWithFormat:@"类型%d", objType];
+                break;
+        }
+        
+        // 获取对象边界框
+        float left, bottom, right, top;
+        if (FPDFPageObj_GetBounds(obj, &left, &bottom, &right, &top)) {
+            [info appendFormat:@"%d. %@ (%.1f,%.1f,%.1f,%.1f)\n", 
+                i + 1, typeName, left, bottom, right, top];
+        } else {
+            [info appendFormat:@"%d. %@\n", i + 1, typeName];
+        }
+        
+        // 如果是文本对象，添加标记（暂时不提取文本内容，因为需要FPDF_TEXTPAGE）
+        if (objType == FPDF_PAGEOBJ_TEXT) {
+            [info appendFormat:@"   [文本对象]\n"];
+        }
+    }
+    
+    FPDF_ClosePage(page);
+    
+    // 更新文本视图
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.inspectorTextView.string = info;
+        NSLog(@"[Inspector] 检查器内容已更新，页面 %d", currentPage + 1);
+    });
 }
 
 @end
