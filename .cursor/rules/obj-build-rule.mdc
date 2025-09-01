@@ -1,0 +1,762 @@
+---
+alwaysApply: false
+---
+
+# 项目构建规则
+
+## 📋 构建顺序概览
+
+**必须严格按照以下顺序构建项目：**
+
+```
+1. pdfium (基础静态库)
+   ↓
+2. pdfium_ex (扩展静态库)
+   ↓
+3. PdfWinViewer (主项目)
+```
+
+**严格要求：**
+- ❌ **绝对禁止使用预构建库**
+- ❌ **绝对禁止使用系统或其他位置的PDFium库**
+- ✅ **必须由 `third_party/pdfium/` 目录构建静态库**
+- ✅ **静态库路径必须为：`third_party/pdfium/out/Debug/obj/libpdfium.a`**
+- ⚠️ **违反构建顺序或路径要求将导致构建失败**
+
+---
+
+## 0. 编译环境配置要求
+
+### 0.1 必需工具和环境
+在开始构建之前，必须确保以下工具已正确安装和配置：
+
+#### 必需工具清单：
+- **GN (Generate Ninja)**: PDFium构建系统
+- **Ninja**: 快速构建工具
+- **Clang/GCC**: C++编译器（支持C++17标准）
+- **Python 3**: 构建脚本依赖
+- **Git**: 源代码管理
+- **CMake**: 主项目构建系统
+
+#### macOS 环境配置：
+```bash
+# 安装 Xcode Command Line Tools
+xcode-select --install
+
+# 安装 depot_tools (包含 gn 和 ninja)
+git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+export PATH="$PWD/depot_tools:$PATH"
+
+# 验证工具安装
+gn --version
+ninja --version
+clang --version
+```
+
+### 0.2 环境变量配置
+```bash
+# 设置构建环境变量
+export CC=clang
+export CXX=clang++
+export AR=ar
+export RANLIB=ranlib
+
+# PDFium 特定环境变量
+export DEPOT_TOOLS_UPDATE=0
+export DEPOT_TOOLS_WIN_TOOLCHAIN=0
+```
+
+### 0.3 预构建库检查和清理
+**绝对禁止使用任何预构建库！**
+
+#### 强制检查规则：
+```bash
+# 检查并删除任何可能存在的预构建库
+find . -name "*.dylib" -o -name "*.so" -o -name "*.dll" | grep -i pdfium
+find . -name "libpdfium*" -not -path "*/out/Debug/obj/*"
+
+# 如果发现预构建库文件，必须删除
+rm -f third_party/pdfium/lib/*
+rm -f third_party/pdfium/bin/*
+rm -rf third_party/pdfium/prebuilt/
+```
+
+#### 源代码完整性验证：
+```bash
+# 验证 PDFium 源代码完整性
+cd third_party/pdfium
+git status
+git log --oneline -5
+
+# 确保所有源文件存在
+ls -la public/fpdfview.h
+ls -la core/
+ls -la fpdfsdk/
+```
+
+## 1. Debug版本构建规则
+
+在构建此项目时，必须遵循以下debug版本构建规则：
+
+- 使用 Debug 配置进行编译，确保包含调试信息
+- 启用所有调试符号和断言
+- 禁用优化以便于调试
+- 在 CMake 中使用 `CMAKE_BUILD_TYPE=Debug`
+- 编译器标志应包含 `-g` (GCC/Clang) 或 `/Zi` (MSVC) 用于调试信息
+- 确保链接器生成调试信息
+
+## 2. PDFium 单一静态库构建规则
+
+PDFium 必须构建为单一的静态库文件，方便链接和部署：
+
+### 2.1 严格构建路径要求
+
+**绝对路径要求 - 不可更改：**
+- **源代码位置**：必须使用 `third_party/pdfium/` 目录下的源代码
+- **构建目录**：必须在 `third_party/pdfium/out/Debug/` 目录构建
+- **静态库输出**：必须生成 `third_party/pdfium/out/Debug/obj/libpdfium.a`
+- **配置文件位置**：必须在 `third_party/pdfium/out/Debug/args.gn`
+
+**严格禁止的行为：**
+- ❌ **禁止使用预构建的 PDFium 库文件**
+- ❌ **禁止从其他目录复制或移动PDFium源代码**
+- ❌ **禁止修改构建输出路径**
+- ❌ **禁止使用系统安装的PDFium**
+- ❌ **禁止使用包管理器安装的PDFium**
+
+**强制要求：**
+- ✅ 使用 GN (Generate Ninja) 构建系统构建 PDFium
+- ✅ **必须构建为单一的静态库文件**
+- ✅ **静态库必须位于指定的精确路径**
+
+### 2.2 强制静态库配置
+**必须严格按照以下配置构建，确保生成单一静态库：**
+
+#### 完整的 args.gn 配置文件：
+```gn
+# ============================================
+# PDFium 静态库构建配置 - 严格执行
+# ============================================
+
+# Debug 构建配置 - 必需
+is_debug = true
+symbol_level = 2
+is_official_build = false
+
+# 静态库配置 - 核心要求
+is_component_build = false
+pdf_is_standalone = true
+pdf_is_complete_lib = true
+use_static_libs = true
+
+# 禁用所有动态依赖 - 确保静态链接
+use_custom_libcxx = false
+use_system_freetype = false
+use_system_libjpeg = false
+use_system_libpng = false
+use_system_zlib = false
+
+# 功能配置 - 简化依赖
+pdf_use_skia = false
+pdf_enable_xfa = false
+pdf_enable_v8 = false
+pdf_use_partition_alloc = false
+
+# 平台配置
+target_os = "mac"
+target_cpu = "arm64"  # 或 "x64" 根据目标平台
+
+# 强制静态库打包 - 关键配置
+pdf_bundle_freetype = true
+pdf_bundle_libjpeg = true
+pdf_bundle_libpng = true
+pdf_bundle_zlib = true
+pdf_bundle_lcms2 = true
+pdf_bundle_libopenjpeg2 = true
+
+# 编译器配置
+treat_warnings_as_errors = false
+use_thin_lto = false
+use_lld = false
+
+# 确保所有依赖都静态链接
+link_pool_depth = 1
+```
+
+#### 配置验证要求：
+- **必须检查** `is_component_build = false`
+- **必须检查** `pdf_is_complete_lib = true`
+- **必须检查** 所有 `pdf_bundle_*` 选项都为 `true`
+- **禁止** 任何 `use_system_*` 选项为 `true`
+
+### 2.3 构建输出要求
+- 构建完成后，必须生成单一的静态库文件：`libpdfium.a`
+- 静态库文件位于 `third_party/pdfium/out/Debug/obj/` 目录
+- 该静态库应包含所有PDFium功能，无需额外依赖库
+- 主项目只需链接这一个静态库文件即可
+
+### 2.4 严格路径和内容验证
+
+**构建完成后必须通过以下所有验证：**
+
+#### 路径验证（严格要求）：
+```bash
+# 1. 验证静态库文件必须在指定位置
+EXPECTED_PATH="third_party/pdfium/out/Debug/obj/libpdfium.a"
+if [ ! -f "${EXPECTED_PATH}" ]; then
+    echo "❌ 错误：静态库不在要求的路径：${EXPECTED_PATH}"
+    exit 1
+fi
+
+# 2. 验证构建目录结构
+if [ ! -d "third_party/pdfium/out/Debug" ]; then
+    echo "❌ 错误：构建目录不存在：third_party/pdfium/out/Debug"
+    exit 1
+fi
+
+# 3. 验证配置文件位置
+if [ ! -f "third_party/pdfium/out/Debug/args.gn" ]; then
+    echo "❌ 错误：配置文件不在要求位置：third_party/pdfium/out/Debug/args.gn"
+    exit 1
+fi
+```
+
+#### 内容验证：
+```bash
+# 4. 验证库文件大小（必须 > 50MB）
+SIZE=$(stat -f%z "${EXPECTED_PATH}" 2>/dev/null || stat -c%s "${EXPECTED_PATH}")
+if [ "$SIZE" -lt 52428800 ]; then
+    echo "❌ 错误：库文件大小异常：$(($SIZE / 1024 / 1024))MB < 50MB"
+    exit 1
+fi
+
+# 5. 验证是否为静态库格式
+file "${EXPECTED_PATH}" | grep -q "ar archive" || {
+    echo "❌ 错误：文件不是有效的静态库格式"
+    exit 1
+}
+
+# 6. 验证必要的PDFium符号
+REQUIRED_SYMBOLS="FPDF_InitLibrary FPDF_LoadDocument FPDF_GetPageCount"
+for symbol in $REQUIRED_SYMBOLS; do
+    if ! nm "${EXPECTED_PATH}" | grep -q "$symbol"; then
+        echo "❌ 错误：缺少必要符号：$symbol"
+        exit 1
+    fi
+done
+```
+
+#### 源代码验证：
+```bash
+# 7. 验证源代码完整性
+if [ ! -f "third_party/pdfium/public/fpdfview.h" ]; then
+    echo "❌ 错误：PDFium源代码不完整"
+    exit 1
+fi
+```
+
+## 3. 构建流程和命令
+
+### 3.1 完整构建流程（严格执行）
+
+#### 第一步：环境检查和准备
+```bash
+# 1. 检查必需工具
+echo "检查构建工具..."
+which gn || { echo "错误: GN 未安装"; exit 1; }
+which ninja || { echo "错误: Ninja 未安装"; exit 1; }
+which clang || { echo "错误: Clang 未安装"; exit 1; }
+
+# 2. 设置环境变量
+export CC=clang
+export CXX=clang++
+export AR=ar
+export RANLIB=ranlib
+export DEPOT_TOOLS_UPDATE=0
+
+# 3. 清理预构建库（强制执行）
+echo "清理可能存在的预构建库..."
+find . -name "*.dylib" -o -name "*.so" -o -name "*.dll" | grep -i pdfium | xargs rm -f
+rm -rf third_party/pdfium/lib/ third_party/pdfium/bin/ third_party/pdfium/prebuilt/
+
+# 4. 强制路径验证并进入PDFium目录
+REQUIRED_PDFIUM_DIR="third_party/pdfium"
+if [ ! -d "${REQUIRED_PDFIUM_DIR}" ]; then
+    echo "❌ 错误：PDFium源代码目录不存在：${REQUIRED_PDFIUM_DIR}"
+    exit 1
+fi
+
+# 验证关键源文件存在
+if [ ! -f "${REQUIRED_PDFIUM_DIR}/public/fpdfview.h" ]; then
+    echo "❌ 错误：PDFium核心头文件不存在，源代码可能不完整"
+    exit 1
+fi
+
+cd "${REQUIRED_PDFIUM_DIR}"
+echo "✅ 已进入PDFium源代码目录：$(pwd)"
+```
+
+#### 第二步：配置构建参数
+```bash
+# 1. 创建构建目录
+mkdir -p out/Debug
+
+# 2. 创建 args.gn 配置文件
+cat > out/Debug/args.gn << 'EOF'
+# PDFium 静态库构建配置 - 严格执行
+is_debug = true
+symbol_level = 2
+is_official_build = false
+is_component_build = false
+pdf_is_standalone = true
+pdf_is_complete_lib = true
+use_static_libs = true
+use_custom_libcxx = false
+use_system_freetype = false
+use_system_libjpeg = false
+use_system_libpng = false
+use_system_zlib = false
+pdf_use_skia = false
+pdf_enable_xfa = false
+pdf_enable_v8 = false
+pdf_use_partition_alloc = false
+target_os = "mac"
+target_cpu = "arm64"
+pdf_bundle_freetype = true
+pdf_bundle_libjpeg = true
+pdf_bundle_libpng = true
+pdf_bundle_zlib = true
+pdf_bundle_lcms2 = true
+pdf_bundle_libopenjpeg2 = true
+treat_warnings_as_errors = false
+use_thin_lto = false
+use_lld = false
+link_pool_depth = 1
+EOF
+
+# 3. 验证配置文件
+echo "验证 args.gn 配置..."
+cat out/Debug/args.gn
+```
+
+#### 第三步：生成构建文件
+```bash
+# 生成 Ninja 构建文件
+echo "生成构建文件..."
+gn gen out/Debug
+
+# 检查生成结果
+if [ $? -ne 0 ]; then
+    echo "错误: GN 生成失败"
+    exit 1
+fi
+```
+
+#### 第四步：执行构建
+```bash
+# 开始构建 PDFium 静态库
+echo "开始构建 PDFium 静态库..."
+ninja -C out/Debug pdfium
+
+# 检查构建结果
+if [ $? -ne 0 ]; then
+    echo "错误: 构建失败"
+    exit 1
+fi
+```
+
+#### 第五步：严格验证构建结果
+```bash
+# 1. 强制路径验证 - 静态库必须在指定位置
+REQUIRED_LIBFILE="out/Debug/obj/libpdfium.a"
+ABSOLUTE_LIBFILE="${PWD}/${REQUIRED_LIBFILE}"
+
+if [ ! -f "${REQUIRED_LIBFILE}" ]; then
+    echo "❌ 错误：静态库文件不在要求位置：${REQUIRED_LIBFILE}"
+    echo "当前目录：$(pwd)"
+    echo "期望路径：${ABSOLUTE_LIBFILE}"
+    exit 1
+fi
+
+# 验证我们确实在正确的PDFium目录中
+if [[ "$(pwd)" != *"third_party/pdfium" ]]; then
+    echo "❌ 错误：不在正确的PDFium源代码目录中"
+    echo "当前目录：$(pwd)"
+    exit 1
+fi
+
+# 2. 验证文件类型
+echo "验证库文件类型..."
+file "${REQUIRED_LIBFILE}"
+
+# 3. 检查文件大小（应该 > 50MB）
+SIZE=$(stat -f%z "${REQUIRED_LIBFILE}" 2>/dev/null || stat -c%s "${REQUIRED_LIBFILE}")
+if [ "$SIZE" -lt 52428800 ]; then  # 50MB
+    echo "❌ 错误：库文件大小异常：$(($SIZE / 1024 / 1024))MB < 50MB"
+    exit 1
+fi
+
+# 4. 验证符号表
+echo "验证符号表..."
+nm "${REQUIRED_LIBFILE}" | grep -E "(FPDF_|PDF_)" | head -10
+
+# 5. 检查是否包含必要的符号
+REQUIRED_SYMBOLS="FPDF_InitLibrary FPDF_LoadDocument FPDF_GetPageCount"
+for symbol in $REQUIRED_SYMBOLS; do
+    if ! nm "${REQUIRED_LIBFILE}" | grep -q "$symbol"; then
+        echo "❌ 错误：缺少必要符号：$symbol"
+        exit 1
+    fi
+done
+
+# 6. 最终路径确认
+echo "✅ PDFium 静态库构建成功！"
+echo "📁 库文件位置：${ABSOLUTE_LIBFILE}"
+echo "📊 文件大小：$(($SIZE / 1024 / 1024))MB"
+echo "🔍 构建目录：$(pwd)"
+```
+
+### 3.2 主项目构建配置
+
+**注意：项目已有完善的CMakeLists.txt配置，请勿随意修改！**
+
+#### 当前项目的链接配置（已存在，无需修改）：
+项目使用 `PDFIUM_STATIC` 变量来指定静态库路径，这是正确的设计。
+
+#### 构建主项目时的正确命令：
+```bash
+# 回到项目根目录
+cd /Users/wps/work/WorkSpace/github/PdfWinViewer
+
+# 创建构建目录
+mkdir -p build && cd build
+
+# 配置项目，指定PDFium静态库路径
+cmake .. -DCMAKE_BUILD_TYPE=Debug \
+         -DPDFIUM_STATIC=/Users/wps/work/WorkSpace/github/PdfWinViewer/third_party/pdfium/out/Debug/obj/libpdfium.a
+
+# 构建项目
+cmake --build . --config Debug
+```
+
+#### 验证链接配置：
+```bash
+# 检查可执行文件的链接依赖
+otool -L PdfWinViewer.app/Contents/MacOS/PdfWinViewer
+
+# 确认没有动态链接到PDFium
+otool -L PdfWinViewer.app/Contents/MacOS/PdfWinViewer | grep -i pdfium
+# 上述命令应该没有输出，表示PDFium已静态链接
+```
+
+### 3.3 强制构建顺序要求
+
+**必须严格按照以下顺序构建项目组件：**
+
+#### 构建顺序：pdfium → pdfium_ex → PdfWinViewer
+
+1. **第一步：构建 PDFium 静态库**
+   ```bash
+   cd third_party/pdfium
+   # 按照前述步骤构建 libpdfium.a
+   ninja -C out/Debug pdfium
+   ```
+   - **输出**：`third_party/pdfium/out/Debug/obj/libpdfium.a`
+   - **验证**：确认文件存在且大小 > 50MB
+
+2. **第二步：构建 PDFium 扩展库 (pdfium_ex)**
+   ```bash
+   cd third_party/pdfium_ex
+   mkdir -p build && cd build
+   cmake .. -DCMAKE_BUILD_TYPE=Debug
+   cmake --build . --config Debug
+   ```
+   - **输出**：`third_party/pdfium_ex/build/libpdfium_ex.a`
+   - **依赖**：需要第一步的 PDFium 静态库
+
+3. **第三步：构建主项目 (PdfWinViewer)**
+   ```bash
+   cd /Users/wps/work/WorkSpace/github/PdfWinViewer
+   mkdir -p build && cd build
+   cmake .. -DCMAKE_BUILD_TYPE=Debug \
+            -DPDFIUM_STATIC=/Users/wps/work/WorkSpace/github/PdfWinViewer/third_party/pdfium/out/Debug/obj/libpdfium.a
+   cmake --build . --config Debug
+   ```
+   - **输出**：`build/PdfWinViewer.app`
+   - **依赖**：需要前两步的静态库
+
+#### 构建顺序的重要性：
+
+- **pdfium** 是基础库，所有其他组件都依赖它
+- **pdfium_ex** 扩展库依赖于 pdfium，提供额外功能
+- **PdfWinViewer** 主项目依赖于前两者，是最终的可执行程序
+
+#### 违反构建顺序的后果：
+- ❌ 跳过 pdfium 构建 → 缺少基础静态库
+- ❌ 跳过 pdfium_ex 构建 → 链接时找不到扩展库
+- ❌ 颠倒构建顺序 → 依赖关系错误，构建失败
+
+#### 验证每个步骤：
+```bash
+# 验证 pdfium
+ls -la third_party/pdfium/out/Debug/obj/libpdfium.a
+
+# 验证 pdfium_ex
+ls -la third_party/pdfium_ex/build/libpdfium_ex.a
+
+# 验证主项目
+ls -la build/PdfWinViewer.app/Contents/MacOS/PdfWinViewer
+```
+
+## 4. 项目集成注意事项
+
+### 4.1 与现有项目设计的兼容性
+
+**重要：本项目已有完善的构建系统设计，请严格遵循以下原则：**
+
+#### 不要修改的文件：
+- ❌ **不要修改 `CMakeLists.txt` 中的链接配置**
+- ❌ **不要修改 `platform/mac/App.mm` 中的头文件引用**
+- ❌ **不要修改 `third_party/pdfium_ex/` 扩展库配置**
+
+#### 项目特定的构建要求：
+- ✅ **必须使用 `-DPDFIUM_STATIC` 参数指定静态库路径**
+- ✅ **静态库路径必须是绝对路径**
+- ✅ **必须先构建 `third_party/pdfium_ex` 扩展库**
+- ✅ **保持现有的框架链接配置不变**
+
+#### 现有项目的优秀设计：
+1. **智能路径检测**：项目会自动检测PDFium头文件位置
+2. **扩展库支持**：集成了 `pdfium_ex` 扩展功能
+3. **完整依赖处理**：自动处理 libc++、libc++abi 等依赖
+4. **跨平台兼容**：Windows和macOS有不同的链接策略
+
+### 4.2 构建PDFium静态库的项目特定配置
+
+基于项目需求，PDFium构建配置需要特别注意：
+
+```gn
+# 项目特定配置 - 必须包含
+target_cpu = "arm64"  # 根据您的Mac架构调整
+pdf_is_complete_lib = true  # 关键：生成完整静态库
+pdf_bundle_freetype = true  # 项目需要的字体支持
+```
+
+### 4.3 验证项目集成
+
+构建完成后，验证项目集成是否正确：
+
+```bash
+# 1. 验证PDFium扩展库
+ls -la third_party/pdfium_ex/build/
+
+# 2. 验证主项目构建
+cd build
+make VERBOSE=1 | grep -i pdfium
+
+# 3. 验证最终可执行文件
+otool -L PdfWinViewer.app/Contents/MacOS/PdfWinViewer
+```
+
+## 5. 关键要求总结
+
+### 5.1 绝对禁止事项
+- ❌ **绝对禁止使用任何预构建的 PDFium 库文件**
+- ❌ **禁止使用系统安装的 PDFium 库**
+- ❌ **禁止下载预编译的二进制文件**
+- ❌ **禁止使用包管理器安装的 PDFium**
+- ❌ **禁止跳过源代码编译步骤**
+- ❌ **禁止修改项目现有的CMakeLists.txt链接配置**
+- ❌ **禁止从非 `third_party/pdfium/` 目录构建静态库**
+- ❌ **禁止修改静态库输出路径**
+- ❌ **禁止复制或移动PDFium源代码到其他位置**
+
+### 5.2 强制路径和构建要求
+- ✅ **必须从 `third_party/pdfium/` 源代码目录构建**
+- ✅ **静态库必须输出到 `third_party/pdfium/out/Debug/obj/libpdfium.a`**
+- ✅ **配置文件必须位于 `third_party/pdfium/out/Debug/args.gn`**
+- ✅ **必须生成单一的完整静态库文件**
+- ✅ **必须使用提供的精确 args.gn 配置**
+- ✅ **必须通过所有路径和内容验证步骤**
+- ✅ **必须确保库文件大小 > 50MB**
+- ✅ **必须包含所有必要的 FPDF_ 符号**
+- ✅ **必须使用 `-DPDFIUM_STATIC` 参数构建主项目**
+
+### 5.3 构建成功标准
+构建完成后，必须满足以下所有条件：
+
+1. **文件存在**: `third_party/pdfium/out/Debug/obj/libpdfium.a` 存在
+2. **文件大小**: 库文件大小 > 50MB
+3. **符号完整**: 包含 `FPDF_InitLibrary`, `FPDF_LoadDocument`, `FPDF_GetPageCount` 等符号
+4. **静态链接**: 库文件为静态库格式（.a 文件）
+5. **无动态依赖**: 不依赖任何外部动态库
+6. **项目集成**: 主项目能够成功链接并运行
+
+### 5.4 故障排除
+如果构建失败，按以下顺序检查：
+
+1. **环境检查**: 确认所有必需工具已安装
+2. **配置检查**: 验证 args.gn 配置正确
+3. **清理重试**: 删除 out/Debug 目录，重新构建
+4. **源代码检查**: 确认 PDFium 源代码完整
+5. **权限检查**: 确认有写入权限
+
+**记住：绝对不能使用预构建库！必须从源代码构建！**
+
+## 6. 完整构建脚本示例
+
+### 6.1 一键构建脚本（推荐使用）
+
+创建以下脚本文件 `build_pdfium_and_project.sh`：
+
+```bash
+#!/bin/bash
+set -e
+
+echo "🚀 开始按顺序构建：pdfium → pdfium_ex → PdfWinViewer"
+
+# 项目根目录
+PROJECT_ROOT="/Users/wps/work/WorkSpace/github/PdfWinViewer"
+PDFIUM_DIR="${PROJECT_ROOT}/third_party/pdfium"
+PDFIUM_STATIC="${PDFIUM_DIR}/out/Debug/obj/libpdfium.a"
+
+# 第一步：构建 PDFium 静态库
+echo "📦 第一步：构建 PDFium 基础静态库..."
+cd "${PDFIUM_DIR}"
+
+# 清理和准备
+rm -rf out/Debug
+mkdir -p out/Debug
+
+# 创建配置文件
+cat > out/Debug/args.gn << 'EOF'
+is_debug = true
+symbol_level = 2
+is_official_build = false
+is_component_build = false
+pdf_is_standalone = true
+pdf_is_complete_lib = true
+use_static_libs = true
+use_custom_libcxx = false
+use_system_freetype = false
+use_system_libjpeg = false
+use_system_libpng = false
+use_system_zlib = false
+pdf_use_skia = false
+pdf_enable_xfa = false
+pdf_enable_v8 = false
+pdf_use_partition_alloc = false
+target_os = "mac"
+target_cpu = "arm64"
+pdf_bundle_freetype = true
+pdf_bundle_libjpeg = true
+pdf_bundle_libpng = true
+pdf_bundle_zlib = true
+pdf_bundle_lcms2 = true
+pdf_bundle_libopenjpeg2 = true
+treat_warnings_as_errors = false
+use_thin_lto = false
+use_lld = false
+link_pool_depth = 1
+EOF
+
+# 生成构建文件
+echo "⚙️  生成构建文件..."
+gn gen out/Debug
+
+# 构建 PDFium
+echo "🔨 构建 PDFium..."
+ninja -C out/Debug pdfium
+
+# 严格验证构建结果和路径
+if [ ! -f "${PDFIUM_STATIC}" ]; then
+    echo "❌ PDFium 构建失败：静态库文件不在要求路径"
+    echo "期望路径：${PDFIUM_STATIC}"
+    echo "当前目录：$(pwd)"
+    exit 1
+fi
+
+# 验证路径的正确性
+EXPECTED_RELATIVE_PATH="out/Debug/obj/libpdfium.a"
+if [ ! -f "${EXPECTED_RELATIVE_PATH}" ]; then
+    echo "❌ 错误：静态库不在PDFium源代码目录的正确位置"
+    echo "当前目录：$(pwd)"
+    exit 1
+fi
+
+# 验证我们在正确的PDFium目录
+if [[ "$(pwd)" != *"third_party/pdfium" ]]; then
+    echo "❌ 错误：不在正确的PDFium源代码目录中"
+    exit 1
+fi
+
+SIZE=$(stat -f%z "${PDFIUM_STATIC}")
+echo "✅ PDFium 构建成功！文件大小: $((SIZE / 1024 / 1024))MB"
+
+# 第二步：构建 PDFium 扩展库 (pdfium_ex)
+echo "📚 第二步：构建 PDFium 扩展库..."
+cd "${PROJECT_ROOT}/third_party/pdfium_ex"
+
+# 创建构建目录
+rm -rf build
+mkdir -p build && cd build
+
+# 配置 pdfium_ex
+echo "⚙️  配置 pdfium_ex..."
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+
+# 构建 pdfium_ex
+echo "🔨 构建 pdfium_ex..."
+cmake --build . --config Debug
+
+# 验证 pdfium_ex 构建结果
+if [ ! -f "libpdfium_ex.a" ]; then
+    echo "❌ pdfium_ex 构建失败：静态库文件不存在"
+    exit 1
+fi
+echo "✅ pdfium_ex 构建成功！"
+
+# 第三步：构建主项目 (PdfWinViewer)
+echo "🏗️  第三步：构建主项目..."
+cd "${PROJECT_ROOT}"
+
+# 创建构建目录
+rm -rf build
+mkdir -p build && cd build
+
+# 配置主项目
+echo "⚙️  配置主项目..."
+cmake .. -DCMAKE_BUILD_TYPE=Debug \
+         -DPDFIUM_STATIC="${PDFIUM_STATIC}"
+
+# 构建主项目
+echo "🔨 构建主项目..."
+cmake --build . --config Debug
+
+# 验证最终结果
+if [ -f "PdfWinViewer.app/Contents/MacOS/PdfWinViewer" ]; then
+    echo "✅ 项目构建成功！"
+    echo "📱 可执行文件: $(pwd)/PdfWinViewer.app/Contents/MacOS/PdfWinViewer"
+    
+    # 验证链接
+    echo "🔍 验证链接依赖..."
+    otool -L PdfWinViewer.app/Contents/MacOS/PdfWinViewer | grep -v "PDFium" || echo "✅ 确认：PDFium 已静态链接"
+else
+    echo "❌ 主项目构建失败"
+    exit 1
+fi
+
+echo "🎉 全部构建完成！"
+```
+
+### 6.2 使用脚本
+
+```bash
+# 给脚本执行权限
+chmod +x build_pdfium_and_project.sh
+
+# 执行构建
+./build_pdfium_and_project.sh
+```
+
+**重要提醒：此脚本严格遵循项目现有设计，不会修改任何项目文件！**
