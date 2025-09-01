@@ -119,8 +119,8 @@ use_system_zlib = false
 
 # 功能配置 - 禁用复杂功能
 pdf_use_skia = false
-pdf_enable_xfa = false
-pdf_enable_v8 = false
+pdf_enable_xfa = true
+pdf_enable_v8 = true
 pdf_use_partition_alloc = false
 
 # 平台配置

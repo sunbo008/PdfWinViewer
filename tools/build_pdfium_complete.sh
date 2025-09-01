@@ -32,14 +32,13 @@ if [ -d "pdfium" ]; then
     echo "📁 PDFium 目录已存在，跳过下载"
 else
     echo "📥 下载 PDFium 源码..."
-    fetch --nohooks pdfium
+    gclient config --unmanaged https://pdfium.googlesource.com/pdfium.git
 fi
-
-cd pdfium
 
 # 同步依赖
 echo "🔄 同步 PDFium 依赖..."
-gclient sync
+gclient sync -v --nohooks
+cd pdfium
 
 # 创建构建配置
 echo "⚙️  配置 PDFium 构建参数..."
@@ -73,8 +72,8 @@ use_custom_libcxx = false    # 关键：使用系统 libc++
 
 # 功能配置 - 简化依赖
 pdf_use_skia = false
-pdf_enable_xfa = false
-pdf_enable_v8 = false
+pdf_enable_xfa = true
+pdf_enable_v8 = true
 pdf_use_partition_alloc = false
 
 # 平台配置
@@ -86,7 +85,6 @@ pdf_bundle_freetype = true
 pdf_bundle_libjpeg = true
 pdf_bundle_libpng = true
 pdf_bundle_zlib = true
-pdf_bundle_lcms2 = true
 pdf_bundle_libopenjpeg2 = true
 
 # 编译器配置
