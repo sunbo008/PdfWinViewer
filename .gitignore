@@ -1,37 +1,32 @@
 # Build directories
-/build/
-/x64/
-/Debug/
-/Release/
-/RelWithDebInfo/
-/.vs/
+build/
+out/
 
-# CMake generated
-/CMakeFiles/
-/CMakeCache.txt
-/cmake_install.cmake
-/*.sln
-/*.vcxproj
-/*.vcxproj.*
+# IDE files
+.vscode/
+.vs/
+*.vcxproj*
+*.sln
 
-# Binaries
-*.exe
-*.dll
-*.pdb
-*.ilk
-*.lib
-*.exp
-*.obj
-*.idb
+# macOS
+.DS_Store
+*.dSYM
 
-# Logs and temp
+# PDFium depot_tools 生成的文件（但保留静态库）
+third_party/.cipd/
+third_party/.gclient*
+third_party/.gcs_entries
+third_party/_bad_scm/
+
+# 保留重要的构建产物
+!third_party/pdfium/out/Debug/obj/libpdfium.a
+!third_party/pdfium/out/Debug/args.gn
+
+# 临时文件
+*.tmp
 *.log
-*.tlog
-*.lastbuildstate
-*.opendb
-*.VC.db
-*.cache
+*.bak
 
-# User/IDE
-*.user
-
+# Xcode
+*.xcodeproj/
+*.xcworkspace/

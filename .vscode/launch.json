@@ -2,34 +2,62 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Debug PdfWinViewer (Enhanced Source Map)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/PdfWinViewer.app/Contents/MacOS/PdfWinViewer",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "env": {
+        "MALLOC_SCRIBBLE": "1",
+        "MALLOC_CHECK_HEAP": "1"
+      },
+      "stopOnEntry": false,
+      "console": "internalConsole",
+      "preLaunchTask": "Build PdfWinViewer",
+      "sourceMap": {
+        "/Users/wps/work/WorkSpace/github/PdfWinViewer": "${workspaceFolder}",
+        "../../core": "${workspaceFolder}/third_party/pdfium/core",
+        "../../fpdfsdk": "${workspaceFolder}/third_party/pdfium/fpdfsdk",
+        "../../third_party": "${workspaceFolder}/third_party/pdfium/third_party",
+        "../..": "${workspaceFolder}/third_party/pdfium",
+        "../../core/fxcrt": "${workspaceFolder}/third_party/pdfium/core/fxcrt",
+        "../../core/fpdfapi": "${workspaceFolder}/third_party/pdfium/core/fpdfapi"
+      },
+      "initCommands": [
+        "settings set target.source-map ../../ ${workspaceFolder}/third_party/pdfium/",
+        "settings set target.source-map ../../core ${workspaceFolder}/third_party/pdfium/core/",
+        "settings set target.source-map ../../fpdfsdk ${workspaceFolder}/third_party/pdfium/fpdfsdk/",
+        "settings set target.source-map ../../third_party ${workspaceFolder}/third_party/pdfium/third_party/",
+        "settings set target.source-map ../../core/fxcrt ${workspaceFolder}/third_party/pdfium/core/fxcrt/",
+        "settings set target.source-map ../../core/fpdfapi ${workspaceFolder}/third_party/pdfium/core/fpdfapi/",
+        "settings show target.source-map",
+        "settings set target.inline-breakpoint-strategy always"
+      ]
+    },
+    {
       "name": "Debug PdfWinViewer (LLDB)",
       "type": "lldb",
       "request": "launch",
-      "program": "${workspaceFolder}/build-mac/PdfWinViewer.app/Contents/MacOS/PdfWinViewer",
-      "cwd": "${workspaceFolder}/build-mac",
+      "program": "${workspaceFolder}/build/PdfWinViewer.app/Contents/MacOS/PdfWinViewer",
+      "cwd": "${workspaceFolder}/build",
       "args": [],
       "env": {},
       "stopOnEntry": false,
-      "console": "internalConsole"
+      "console": "internalConsole",
+      "preLaunchTask": "Build PdfWinViewer"
     },
     {
-      "name": "Debug PdfWinViewer (cppdbg LLDB)",
+      "name": "Debug PdfWinViewer (cppdbg)",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build-mac/PdfWinViewer.app/Contents/MacOS/PdfWinViewer",
-      "cwd": "${workspaceFolder}/build-mac",
+      "program": "${workspaceFolder}/build/PdfWinViewer.app/Contents/MacOS/PdfWinViewer",
+      "cwd": "${workspaceFolder}/build",
       "args": [],
       "environment": [],
       "MIMode": "lldb",
-      "externalConsole": false
+      "externalConsole": false,
+      "preLaunchTask": "Build PdfWinViewer"
     }
   ]
-}
-
-{
-    // 使用 IntelliSense 了解相关属性。 
-    // 悬停以查看现有属性的描述。
-    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": []
 }

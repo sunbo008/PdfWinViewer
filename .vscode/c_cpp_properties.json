@@ -1,0 +1,36 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "macOS",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/third_party/pdfium/public",
+                "${workspaceFolder}/third_party/pdfium_ex/include",
+                "${workspaceFolder}/third_party/pdfium/core",
+                "${workspaceFolder}/third_party/pdfium/fpdfsdk",
+                "${workspaceFolder}/platform/mac",
+                "${workspaceFolder}/platform/shared",
+                "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include",
+                "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1"
+            ],
+            "defines": [
+                "TARGET_OS_MAC=1",
+                "PDFIUM_IMPLEMENTATION",
+                "PDF_IS_STANDALONE=1",
+                "PDF_IS_COMPLETE_LIB=1",
+                "USE_CUSTOM_LIBCXX=1",
+                "_DEBUG"
+            ],
+            "macFrameworkPath": [
+                "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks"
+            ],
+            "compilerPath": "/usr/bin/clang++",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "macos-clang-arm64",
+            "configurationProvider": "ms-vscode.cmake-tools",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json"
+        }
+    ]
+}

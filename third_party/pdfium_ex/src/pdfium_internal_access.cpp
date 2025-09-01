@@ -63,10 +63,10 @@ std::string ObjectToPdfString(const CPDF_Object* obj, int depth = 0) {
             break;
         }
         case CPDF_Object::kString:
-            oss << "(" << obj->GetString() << ")";
+            oss << "(" << obj->GetString().c_str() << ")";
             break;
         case CPDF_Object::kName:
-            oss << "/" << obj->GetString();
+            oss << "/" << obj->GetString().c_str();
             break;
         case CPDF_Object::kArray: {
             oss << "[ ";
@@ -84,7 +84,7 @@ std::string ObjectToPdfString(const CPDF_Object* obj, int depth = 0) {
             // 使用CPDF_DictionaryLocker来遍历字典
             CPDF_DictionaryLocker locker(dict);
             for (const auto& pair : locker) {
-                oss << "/" << pair.first << " " 
+                oss << "/" << pair.first.c_str() << " " 
                     << ObjectToPdfString(pair.second.Get(), depth + 1) << " ";
             }
             oss << ">>";

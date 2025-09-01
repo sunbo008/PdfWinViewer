@@ -400,7 +400,7 @@ static void BuildObjectTreeWithQueue(FPDF_DOCUMENT document, PDFIUM_EX_OBJECT_TR
     object_tree_map[root->obj_num] = root;
     
     int processed_count = 0;
-    while (!analysis_queue.empty() && processed_count < 500) { // 限制总处理数量防止无限循环
+    while (!analysis_queue.empty() && processed_count < 10000) { // 限制总处理数量防止无限循环
         processed_count++;
         
         auto current = analysis_queue.front();

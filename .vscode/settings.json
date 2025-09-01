@@ -1,0 +1,35 @@
+{
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "cmake.configureArgs": [
+        "-DCMAKE_BUILD_TYPE=Debug",
+        "-DPDFIUM_STATIC=${workspaceFolder}/third_party/pdfium/out/Debug/obj/libpdfium.a"
+    ],
+    "files.associations": {
+        "*.h": "c",
+        "*.cpp": "cpp",
+        "*.mm": "objective-cpp",
+        "*.gn": "python",
+        "*.gni": "python"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+    "C_Cpp.default.cStandard": "c17",
+    "C_Cpp.default.cppStandard": "c++20",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/third_party/pdfium/public",
+        "${workspaceFolder}/third_party/pdfium_ex/include"
+    ],
+    "C_Cpp.default.defines": [
+        "TARGET_OS_MAC=1",
+        "PDFIUM_IMPLEMENTATION"
+    ],
+    "editor.formatOnSave": true,
+    "cmake.generator": "Unix Makefiles",
+    "cmake.buildBeforeRun": true,
+    "lldb.library": "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/LLDB",
+    "lldb.launch.sourceMap": {
+        "/Users/wps/work/WorkSpace/github/PdfWinViewer": "${workspaceFolder}"
+    }
+}
