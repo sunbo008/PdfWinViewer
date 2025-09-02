@@ -24,7 +24,8 @@ PdfWinViewer/
     pdfium/               # PDFium 源码（depot_tools checkout）
     pdfium_ex/            # PDFium 扩展库
   tools/
-    build_pdfium_complete.sh  # 完整构建脚本
+    build_pdfium_complete.py  # Python 交互式构建脚本（推荐）
+    build_pdfium_complete.sh  # Shell 构建脚本（传统方式）
 ```
 
 ## 先决条件
@@ -40,8 +41,40 @@ PdfWinViewer/
 
 ## 快速开始（推荐）
 
-### 一键构建脚本
-使用提供的完整构建脚本，从下载到构建完成：
+### Python 构建脚本（推荐）
+使用 Python 版本的交互式构建脚本，支持灵活配置和调试：
+
+```bash
+# 直接运行 Python 脚本
+python3 tools/build_pdfium_complete.py
+```
+
+**功能特性：**
+- 🎯 **交互式菜单**：清晰的选项说明，支持不同构建模式
+- ⚙️  **灵活配置**：可选择 Debug/Release、V8 JavaScript 支持、XFA 表单支持
+- 🧹 **智能清理**：自动检测构建状态，支持增量构建或完全重建
+- 🐛 **易于调试**：Python 代码结构清晰，支持断点调试
+- 🎨 **彩色输出**：直观的构建进度和状态提示
+- 🔧 **错误处理**：完善的异常处理和用户友好的错误提示
+
+**构建选项：**
+1. **配置并完全构建** - 可自定义所有选项（推荐首次构建）
+2. **使用默认配置快速构建** - Debug + V8 + XFA 完整功能
+3. **仅清理构建产物** - 解决构建问题时使用
+4. **仅构建 PDFium 静态库** - 可自定义配置选项
+5. **仅构建主项目** - 需要已存在的 PDFium 静态库
+
+**命令行参数：**
+```bash
+# 调试模式（显示详细错误信息）
+python3 tools/build_pdfium_complete.py --debug
+
+# 仅清理构建产物
+python3 tools/build_pdfium_complete.py --clean
+```
+
+### Shell 构建脚本（传统方式）
+也可以使用传统的 Shell 脚本：
 
 ```bash
 # 赋予执行权限
@@ -51,7 +84,7 @@ chmod +x tools/build_pdfium_complete.sh
 ./tools/build_pdfium_complete.sh
 ```
 
-这个脚本会：
+两个脚本都会：
 1. 检查 depot_tools 环境
 2. 下载 PDFium 源码（如果不存在）
 3. 同步所有依赖

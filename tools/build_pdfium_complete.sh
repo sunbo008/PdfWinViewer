@@ -87,6 +87,11 @@ pdf_bundle_libpng = true
 pdf_bundle_zlib = true
 pdf_bundle_libopenjpeg2 = true
 
+# 强制使用 C++20 标准
+use_cxx17 = false
+use_cxx23 = false
+# PDFium 默认使用 C++20，这里明确确保
+
 # 编译器配置
 treat_warnings_as_errors = false
 EOF
