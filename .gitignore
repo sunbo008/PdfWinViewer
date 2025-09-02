@@ -17,6 +17,7 @@ third_party/.cipd/
 third_party/.gclient*
 third_party/.gcs_entries
 third_party/_bad_scm/
+third_party/pdfium/
 
 # 保留重要的构建产物
 !third_party/pdfium/out/Debug/obj/libpdfium.a
