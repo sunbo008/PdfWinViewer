@@ -1,6 +1,7 @@
 # PdfWinViewer 使用说明
 
 一个跨平台的 PDFium 查看器，支持 Windows (Win32) 和 macOS (Cocoa)。功能特性：
+
 - XFA/V8（取决于你的 PDFium 构建）
 - 高 DPI 感知（Per‑Monitor V2 on Windows）
 - 文本清晰度优化（FPDF_LCD_TEXT）
@@ -10,6 +11,7 @@
 - 静态链接 PDFium，避免 DLL 依赖
 
 ## 目录结构
+
 ```
 PdfWinViewer/
   CMakeLists.txt          # CMake 构建脚本
@@ -31,17 +33,38 @@ PdfWinViewer/
 ## 先决条件
 
 ### Windows
+
 - Windows 10/11，Visual Studio 2022（v143 工具集）
 - 推荐在"VS 2022 开发者命令提示符"中执行以下命令
 
 ### macOS
+
 - macOS 10.15+ (Catalina)，Xcode 12+
-- 安装 depot_tools：`git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git`
-- 将 depot_tools 添加到 PATH：`export PATH=$PATH:/path/to/depot_tools`
+- 无需手动安装 depot_tools；推荐使用脚本自动配置
+
+### depot_tools（自动配置，所有平台）
+
+- 推荐使用 Python 脚本自动检测、下载并配置 depot_tools 到 PATH：
+
+```bash
+python3 tools/build_pdfium_complete.py --setup-depot-tools
+```
+
+- 完整构建流程也会在缺少 depot_tools 时自动完成配置
+- 安装后可用以下命令验证：
+
+```bash
+fetch --help
+gclient --help
+gn --help
+```
+
+- Windows 如需手动配置 PATH：系统属性 → 高级系统设置 → 环境变量 → 编辑 Path，新增 `%USERPROFILE%\depot_tools`
 
 ## 快速开始（推荐）
 
 ### Python 构建脚本（推荐）
+
 使用 Python 版本的交互式构建脚本，支持灵活配置和调试：
 
 ```bash
@@ -50,14 +73,17 @@ python3 tools/build_pdfium_complete.py
 ```
 
 **功能特性：**
+
+- ⚙️ **自动配置 depot_tools**：必要时自动检测、下载并加入 PATH
 - 🎯 **交互式菜单**：清晰的选项说明，支持不同构建模式
-- ⚙️  **灵活配置**：可选择 Debug/Release、V8 JavaScript 支持、XFA 表单支持
+- ⚙️ **灵活配置**：可选择 Debug/Release、V8 JavaScript 支持、XFA 表单支持
 - 🧹 **智能清理**：自动检测构建状态，支持增量构建或完全重建
 - 🐛 **易于调试**：Python 代码结构清晰，支持断点调试
 - 🎨 **彩色输出**：直观的构建进度和状态提示
 - 🔧 **错误处理**：完善的异常处理和用户友好的错误提示
 
 **构建选项：**
+
 1. **配置并完全构建** - 可自定义所有选项（推荐首次构建）
 2. **使用默认配置快速构建** - Debug + V8 + XFA 完整功能
 3. **仅清理构建产物** - 解决构建问题时使用
@@ -65,6 +91,7 @@ python3 tools/build_pdfium_complete.py
 5. **仅构建主项目** - 需要已存在的 PDFium 静态库
 
 **命令行参数：**
+
 ```bash
 # 调试模式（显示详细错误信息）
 python3 tools/build_pdfium_complete.py --debug
@@ -73,7 +100,29 @@ python3 tools/build_pdfium_complete.py --debug
 python3 tools/build_pdfium_complete.py --clean
 ```
 
+### 其他常用命令
+
+- 仅设置 depot_tools：
+
+```bash
+python3 tools/build_pdfium_complete.py --setup-depot-tools
+```
+
+- 测试 depot_tools 环境：
+
+```bash
+python3 tools/test_depot_tools.py
+```
+
+### 故障排除（depot_tools）
+
+- 下载失败：检查网络、代理或防火墙
+- 权限被拒绝：确保脚本可执行（例如 `chmod +x tools/build_pdfium_complete.py`）
+- PATH 不生效：重新打开终端，或 `source ~/.zshrc` / `source ~/.bashrc`
+- 命令找不到：确认 `~/depot_tools` 已存在并在 PATH 中，检查 `echo $PATH`
+
 ### Shell 构建脚本（传统方式）
+
 也可以使用传统的 Shell 脚本：
 
 ```bash
@@ -85,7 +134,8 @@ chmod +x tools/build_pdfium_complete.sh
 ```
 
 两个脚本都会：
-1. 检查 depot_tools 环境
+
+1. 检查并自动配置 depot_tools 环境（如缺失）
 2. 下载 PDFium 源码（如果不存在）
 3. 同步所有依赖
 4. 配置静态库构建（使用系统 libc++）
@@ -97,7 +147,9 @@ chmod +x tools/build_pdfium_complete.sh
 ## 构建 PDFium（静态库，推荐）
 
 ### macOS 静态库构建
+
 配置文件 `third_party/pdfium/out/Debug/args.gn`：
+
 ```gn
 # 调试友好的 Release 配置
 is_debug = false  # Release 模式，避免断言
@@ -131,6 +183,7 @@ pdf_bundle_libopenjpeg2 = true
 ```
 
 生成与编译：
+
 ```bash
 cd third_party/pdfium
 ./buildtools/mac/gn gen out/Debug
@@ -140,7 +193,9 @@ ninja -C out/Debug pdfium
 成功后应得到：`out/Debug/obj/libpdfium.a`（约 140MB）。
 
 ### Windows DLL 构建（传统方式）
+
 确保 `pdfium/out/XFA/args.gn` 至少包含：
+
 ```gn
 is_debug = true
 pdf_is_standalone = true
@@ -148,18 +203,23 @@ pdf_enable_v8 = true
 pdf_enable_xfa = true
 is_component_build = true   # 关键：生成 pdfium.dll
 ```
+
 生成与编译：
+
 ```bat
 cd /d D:\workspace\pdfium_20250814\pdfium
 buildtools\win\gn.exe gen out\XFA
 ..\depot_tools\ninja.bat -C out\XFA pdfium
 ```
+
 成功后应得到：`out\XFA\pdfium.dll` 与 `out\XFA\pdfium.dll.lib`。
 
 ## 构建主项目（CMake）
 
 ### macOS 构建
+
 使用静态库构建（推荐）：
+
 ```bash
 mkdir -p build
 cd build
@@ -170,20 +230,26 @@ cmake --build . --config Debug
 可执行文件位置：`build/PdfWinViewer.app/Contents/MacOS/PdfWinViewer`
 
 ### Windows 构建
+
 在"VS 2022 开发者命令提示符"中执行：
+
 ```bat
 cd /d <PdfWinViewer项目目录路径>
 ```
 
 #### 情况一：使用内置 PDFium（推荐）
+
 项目内已包含构建好的 PDFium 静态库：
+
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Debug --parallel
 ```
 
 #### 情况二：使用外部 PDFium
+
 如果需要使用自己的 PDFium 构建：
+
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DPDFIUM_ROOT=<pdfium目录路径>
 cmake --build build --config Debug --parallel
@@ -192,6 +258,7 @@ cmake --build build --config Debug --parallel
 可执行文件位置：`build\Debug\PdfWinViewer.exe`
 
 ### 构建选项
+
 - **静态链接**：默认使用静态库，无需 DLL 依赖
 - **调试符号**：包含完整调试信息，支持源码级调试
 - **跨平台**：同一套代码支持 Windows 和 macOS
@@ -199,6 +266,7 @@ cmake --build build --config Debug --parallel
 ## 静态库构建说明
 
 ### 为什么选择静态库？
+
 1. **部署简单**：无需分发额外的 DLL 文件
 2. **版本控制**：避免 DLL 版本冲突
 3. **调试友好**：包含完整的调试符号
@@ -207,14 +275,17 @@ cmake --build build --config Debug --parallel
 ### 关键技术选择
 
 #### 使用系统 libc++
+
 ```gn
 use_custom_libcxx = false  # 关键设置
 ```
+
 - **优势**：避免 `std::__Cr` 和 `std::__1` 符号冲突
 - **兼容性**：与主项目使用相同的标准库
 - **调试体验**：更好的调试器支持
 
 #### 调试友好的 Release 配置
+
 ```gn
 is_debug = false      # Release 优化，避免断言
 symbol_level = 2      # 完整调试符号
@@ -222,7 +293,9 @@ strip_debug_info = false  # 保留调试信息
 ```
 
 ### 已构建的静态库
+
 项目包含预构建的 PDFium 静态库：
+
 - **文件**：`third_party/pdfium/out/Debug/obj/libpdfium.a`
 - **大小**：约 140MB
 - **架构**：Apple Silicon (arm64)
@@ -230,7 +303,9 @@ strip_debug_info = false  # 保留调试信息
 - **功能**：不包含 XFA/V8，专注核心 PDF 功能
 
 ### 重新构建静态库
+
 如需重新构建（例如修改配置）：
+
 ```bash
 cd third_party/pdfium
 ./buildtools/mac/gn gen out/Debug
@@ -238,6 +313,7 @@ ninja -C out/Debug pdfium
 ```
 
 ### 不想本地构建？
+
 - 你可以直接从历史提交获取已构建好的运行所需 DLL 文件：
   - 提交号：`89c1980`
   - 该提交包含 `build/Debug/` 下运行所需的 `*.dll`（例如 `pdfium.dll`、`v8*.dll` 等）与示例可执行文件，可用于快速运行验证。
@@ -246,6 +322,7 @@ ninja -C out/Debug pdfium
 ## IDE/.vscode 集成与脚本自动生成
 
 ### .vscode 自动生成与增量合并（支持 Cursor / CodeLLDB）
+
 - 默认开启：`-DGENERATE_VSCODE=ON`。配置阶段：
   - 若工作区根目录不存在 `.vscode/launch.json`、`.vscode/tasks.json`，则根据模板自动生成；
   - 若已存在，则进行“增量合并”，不会覆盖你已有的配置：
@@ -264,6 +341,7 @@ ninja -C out/Debug pdfium
 - 关闭自动生成：`-DGENERATE_VSCODE=OFF`。
 
 ### msbuild 编译脚本（相对路径，可移植）
+
 - 配置阶段自动生成（若文件不存在才生成，不会覆盖）：
   - `PdfWinViewer/msbuild_build_project_debug_x64.cmd`
 - 脚本特点：
@@ -274,14 +352,16 @@ ninja -C out/Debug pdfium
 - 与任务联动：`.vscode/tasks.json` 的 `Build PdfWinViewer Debug x64` 会调用上述脚本。
 - 重新生成脚本：删除对应 `.cmd` 后重新执行 CMake 配置即可。
 - 脚本使用：
-  -PowerShell中执行： cmd /d /s /c "D:\workspace\pdfium_20250814\PdfWinViewer\msbuild_build_project_debug_x64.cmd"
+  -PowerShell 中执行： cmd /d /s /c "D:\workspace\pdfium_20250814\PdfWinViewer\msbuild_build_project_debug_x64.cmd"
 
 ### 依赖与注意事项
+
 - 无需 PowerShell 7。合并器使用系统自带的 Windows PowerShell（`powershell.exe`），入口为 `PdfWinViewer/tools/merge_json.cmd`，实际调用同目录下的 `merge_json.ps1`；
 - 如 VS 安装路径不同（Community/Enterprise），请在生成的任务或脚本中调整 `VsDevCmd.bat` 的路径；
 - 模板中的 `@CMAKE_BUILD_TYPE@` 会在配置时替换为当前配置（如 `Debug`），保持与生成/调试配置一致。
 
 ## 运行
+
 - 双击 `build\Debug\PdfWinViewer.exe`
 - File → Open… 选择 PDF
 - Ctrl+滚轮缩放，滚轮或滚动条滚动
@@ -294,6 +374,7 @@ ninja -C out/Debug pdfium
 ![项目展示](image1.png)
 
 ## 一键复现/生成同类项目的 Prompt（可复制给 AI）
+
 > 请将下述 Prompt 粘贴到支持代码生成/编辑的 AI 中（如 Cursor / GitHub Copilot Chat），AI 将基于 PDFium 生成一个 Win32 查看器并实现完整的右键导出功能与页码编辑等特性。
 
 ```
@@ -325,8 +406,8 @@ ninja -C out/Debug pdfium
 
 > 小贴士：若你的系统禁用了 WIC JPEG 编码器，工程会自动回退为 PNG 保存；请确保对目标目录有写权限（避免 UAC 保护路径）。
 
-
 ## 常见问题
+
 - 文本不清晰：已启用 `FPDF_LCD_TEXT`；若仍模糊，检查显示缩放与显卡驱动，或尝试将窗口放大以减少二次缩放。
 - XFA 行为异常：确认 `args.gn` 已开启 `pdf_enable_xfa = true` 且在加载后调用了 `FPDF_LoadXFA`（本工程已自动处理）。
 - 缺少 dll：从 `pdfium/out/XFA` 复制所有 `*.dll` 到可执行目录。
@@ -335,18 +416,23 @@ ninja -C out/Debug pdfium
 ---
 
 # English (Quick Guide)
+
 A minimal Win32 PDF viewer using Windows SDK + PDFium. Features: high‑DPI, LCD text rendering, scrollbars, zoom (Ctrl+Wheel), XFA/V8 (if enabled), recent files.
 
 ## Build PDFium (component build)
+
 Enable `is_component_build = true` in `out/XFA/args.gn`, then:
+
 ```bat
 cd D:\workspace\pdfium_20250814\pdfium
 buildtools\win\gn.exe gen out\XFA
 ..\depot_tools\ninja.bat -C out\XFA pdfium
 ```
+
 It should produce `out\XFA\pdfium.dll` and `pdfium.dll.lib`.
 
 ## Build Viewer (CMake)
+
 ```bat
 cd D:\workspace\pdfium_20250814\PdfWinViewer
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
@@ -354,6 +440,11 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
   -DPDFIUM_OUT=D:/workspace/pdfium_20250814/pdfium/out/XFA
 cmake --build build --config Debug --parallel
 ```
+
 Run: `build\Debug\PdfWinViewer.exe`
 
 DLLs from `out\XFA` are copied post‑build automatically. If anything is missing, copy all `*.dll` manually.
+
+```
+
+```
