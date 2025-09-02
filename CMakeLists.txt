@@ -49,13 +49,13 @@ elseif(APPLE)
   )
 endif()
 
-# 日志编译期开关（Debug 默认启用，Release 默认关闭；可通过 -DPDFWV_ENABLE_LOGGING=0/1 覆盖）
-option(PDFWV_ENABLE_LOGGING "Enable in-app logging" OFF)
+# 日志编译期开关（Debug 和 Release 都默认启用；可通过 -DPDFWV_ENABLE_LOGGING=OFF 禁用）
+option(PDFWV_ENABLE_LOGGING "Enable in-app logging" ON)
 if (WIN32)
-  target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX PDFWV_ENABLE_LOGGING=$<IF:$<CONFIG:Debug>,1,$<BOOL:${PDFWV_ENABLE_LOGGING}>>)
+  target_compile_definitions(PdfWinViewer PRIVATE UNICODE _UNICODE NOMINMAX PDFWV_ENABLE_LOGGING=$<BOOL:${PDFWV_ENABLE_LOGGING}>)
 elseif(APPLE)
-  # macOS 也携带同名开关：Debug 默认 1，Release 依据 CMake 选项
-  target_compile_definitions(PdfWinViewer PRIVATE PDFWV_ENABLE_LOGGING=$<IF:$<CONFIG:Debug>,1,$<BOOL:${PDFWV_ENABLE_LOGGING}>>)
+  # macOS 日志开关：Debug 和 Release 都依据 CMake 选项，默认启用
+  target_compile_definitions(PdfWinViewer PRIVATE PDFWV_ENABLE_LOGGING=$<BOOL:${PDFWV_ENABLE_LOGGING}>)
 endif()
 
 target_include_directories(PdfWinViewer PRIVATE
