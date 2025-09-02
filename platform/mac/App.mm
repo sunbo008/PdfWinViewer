@@ -24,7 +24,7 @@ static const CGFloat kScrollBarWidth = 15.0; // 垂直滚动条宽度
 
 // ================= 日志子系统（与 Windows 对齐） =================
 #if !defined(PDFWV_ENABLE_LOGGING)
-#define PDFWV_ENABLE_LOGGING 0
+#define PDFWV_ENABLE_LOGGING 1
 #endif
 
 enum class LogLevel { Critical, Error, Warning, Debug, Trace };
@@ -240,9 +240,9 @@ static void MacLog_SetEnabled(bool on);
 }
 @end
 
-// 默认不启用日志，直到用户点击“日志”
+// 默认启用日志记录（性能日志总是记录到文件，窗口显示可选）
 static bool &_LogEnabledRef() {
-  static bool e = false;
+  static bool e = true;  // 改为默认启用
   return e;
 }
 
@@ -571,13 +571,11 @@ static inline std::string NSStringToUTF8(NSObject *obj) {
   }
   int pc = FPDF_GetPageCount(_doc);
   NSLog(@"[PdfWinViewer] document loaded. pageCount=%d", pc);
-// 首次渲染计时起点（仅当日志已启用并且窗口已创建时，避免无谓开销）
+// 首次渲染计时起点（只要编译时启用日志就记录，运行时再判断是否输出）
 #if PDFWV_ENABLE_LOGGING
-  if (MacLog_IsEnabled() && _gLogCtrl) {
-    _openStartSec = NowSeconds();
-    _firstRenderAfterOpen = true;
-    _lastMemMB = GetProcessMemMB();
-  }
+  _openStartSec = NowSeconds();
+  _firstRenderAfterOpen = true;
+  _lastMemMB = GetProcessMemMB();
 #endif
   [self updateViewSizeToFitPage];
   [self setNeedsDisplay:YES];
@@ -781,7 +779,7 @@ static inline std::string NSStringToUTF8(NSObject *obj) {
     return;
   }
 #if PDFWV_ENABLE_LOGGING
-  bool _logActive = (MacLog_IsEnabled() && _gLogCtrl);
+  bool _logActive = MacLog_IsEnabled();
   double t0 = _logActive ? NowSeconds() : 0.0;
 #endif
   double wpt = 0, hpt = 0;
@@ -2999,7 +2997,7 @@ static TocNode *BuildBookmarksTree(FPDF_DOCUMENT doc) {
 }
 
 - (IBAction)openLogWindow:(id)sender {
-  MacLog_SetEnabled(true);
+  // 日志记录默认已启用，这里只是显示窗口
   Log_ShowWindow();
 }
 
