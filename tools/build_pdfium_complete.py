@@ -32,6 +32,7 @@ import sys
 import subprocess
 import platform
 import shutil
+import time
 from pathlib import Path
 from typing import Tuple, Optional
 import argparse
@@ -173,27 +174,72 @@ class DepotToolsManager:
                 unique_paths.append(p)
         return unique_paths
     
+    def _show_current_depot_tools_in_path(self):
+        """显示当前PATH中的所有depot_tools条目"""
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        depot_entries = [entry for entry in path_entries if 'depot_tools' in entry.lower()]
+        
+        if depot_entries:
+            Logger.info(f"当前PATH中发现 {len(depot_entries)} 个 depot_tools 条目:")
+            for i, entry in enumerate(depot_entries, 1):
+                Logger.info(f"  {i}. {entry}")
+        else:
+            Logger.info("当前PATH中未发现 depot_tools 条目")
+    
+    def _clean_current_process_path(self):
+        """尝试清理当前进程的PATH环境变量（注意：这只影响Python进程，不影响shell）"""
+        Logger.info("尝试清理当前Python进程的PATH环境变量...")
+        
+        original_path = os.environ.get("PATH", "")
+        path_entries = original_path.split(os.pathsep)
+        
+        # 过滤掉包含depot_tools的条目
+        clean_entries = [entry for entry in path_entries if 'depot_tools' not in entry.lower()]
+        
+        # 去重，保持顺序
+        seen = set()
+        unique_entries = []
+        for entry in clean_entries:
+            if entry not in seen and entry.strip():
+                seen.add(entry)
+                unique_entries.append(entry)
+        
+        new_path = os.pathsep.join(unique_entries)
+        
+        if new_path != original_path:
+            os.environ["PATH"] = new_path
+            removed_count = len(path_entries) - len(unique_entries)
+            Logger.info(f"已从Python进程PATH中移除 {removed_count} 个条目")
+            Logger.warning("⚠️  注意：这只影响Python进程，不影响当前shell")
+        else:
+            Logger.info("当前Python进程PATH无需清理")
+    
     def clean_depot_tools(self):
         """彻底清理 depot_tools，包括通过 PATH 查找并删除目录、移除 PATH 配置"""
         Logger.info("开始彻底清理 depot_tools...")
+        
+        # 0. 显示当前PATH中的depot_tools条目
+        self._show_current_depot_tools_in_path()
         
         # 1) 从 PATH 中查找 depot_tools 目录并尝试删除
         found_paths = self.find_depot_tools_paths()
         if not found_paths:
             Logger.info("未在 PATH 中发现 depot_tools 目录")
-        for p in found_paths:
-            try:
-                if p.exists() and p.is_dir() and p.name.lower() == "depot_tools":
-                    Logger.info(f"删除 depot_tools 目录: {p}")
-                    shutil.rmtree(p)
-                    Logger.success(f"已删除: {p}")
-            except Exception as e:
-                Logger.warning(f"删除失败 {p}: {e}")
+        else:
+            Logger.info(f"发现 {len(found_paths)} 个 depot_tools 目录")
+            for p in found_paths:
+                try:
+                    if p.exists() and p.is_dir() and p.name.lower() == "depot_tools":
+                        Logger.info(f"删除 depot_tools 目录: {p}")
+                        shutil.rmtree(p)
+                        Logger.success(f"已删除: {p}")
+                except Exception as e:
+                    Logger.warning(f"删除失败 {p}: {e}")
         
         # 兼容：再次尝试删除脚本默认目录
         if self.depot_tools_dir.exists():
             try:
-                Logger.info(f"删除 depot_tools 目录: {self.depot_tools_dir}")
+                Logger.info(f"删除默认 depot_tools 目录: {self.depot_tools_dir}")
                 shutil.rmtree(self.depot_tools_dir)
                 Logger.success("默认 depot_tools 目录已删除")
             except Exception as e:
@@ -214,35 +260,115 @@ class DepotToolsManager:
             Logger.info("请手动从 shell 配置文件中移除以下行:")
             Logger.info(f"  export PATH=\"{self.depot_tools_dir}:$PATH\"")
         
+        # 3. 清理当前进程的PATH环境变量
+        self._clean_current_process_path()
+        
+        # 4. 验证清理结果
+        Logger.info("验证清理结果...")
+        remaining_paths = self.find_depot_tools_paths()
+        if remaining_paths:
+            Logger.warning(f"仍有 {len(remaining_paths)} 个 depot_tools 目录残留:")
+            for p in remaining_paths:
+                Logger.warning(f"  {p}")
+        else:
+            Logger.success("所有 depot_tools 目录已清理完成")
+        
         Logger.success("depot_tools 彻底清理完成!")
-        Logger.info("请重新打开终端或运行 'source ~/.zshrc' (macOS) 使配置生效")
+        
+        # 5. 检查当前shell PATH状态并提供解决方案
+        Logger.info("检查当前shell PATH状态...")
+        
+        # 重新检查当前进程的PATH（因为_clean_current_process_path可能没有实际影响shell）
+        current_path = os.environ.get("PATH", "")
+        current_depot_entries = [entry for entry in current_path.split(os.pathsep) if 'depot_tools' in entry.lower()]
+        
+        if current_depot_entries:
+            Logger.warning("⚠️  当前shell进程的PATH仍包含depot_tools条目")
+            Logger.info(f"   发现 {len(current_depot_entries)} 个条目:")
+            for i, entry in enumerate(current_depot_entries, 1):
+                Logger.info(f"   {i}. {entry}")
+            
+            Logger.info("💡 这是正常现象，原因：")
+            Logger.info("   • 当前shell继承了启动时的PATH")
+            Logger.info("   • Python进程环境变量清理不影响父shell")
+            
+            Logger.info("🔧 解决方案（任选一种）：")
+            Logger.info("   1. 重新打开终端窗口（推荐）⭐")
+            Logger.info("   2. 运行：exec $SHELL -l")
+            Logger.info("   3. 运行：source ~/.zshrc")
+            Logger.info("   4. 手动清理：export PATH=$(echo $PATH | tr ':' '\\n' | grep -v depot_tools | tr '\\n' ':' | sed 's/:$//')")
+            
+            # 验证新shell是否干净
+            try:
+                result = subprocess.run(
+                    ['zsh', '-c', 'echo $PATH | tr ":" "\\n" | grep depot_tools | wc -l'],
+                    capture_output=True, text=True, check=True
+                )
+                new_shell_count = int(result.stdout.strip())
+                if new_shell_count == 0:
+                    Logger.success("✅ 验证：新shell环境已清理干净")
+                    Logger.info("   配置文件清理成功，新终端将完全干净")
+                else:
+                    Logger.error(f"❌ 警告：新shell仍有 {new_shell_count} 个depot_tools条目")
+                    Logger.error("   可能存在其他配置文件，请手动检查")
+            except Exception as e:
+                Logger.warning(f"无法验证新shell环境: {e}")
+        else:
+            Logger.success("✅ 当前shell PATH已完全清理")
+        
         return True
     
     def _remove_from_macos_path(self):
         """从 macOS shell 配置文件中移除 depot_tools PATH"""
-        shell_rc_files = []
-        if os.path.exists(os.path.expanduser("~/.zshrc")):
-            shell_rc_files.append(os.path.expanduser("~/.zshrc"))
-        if os.path.exists(os.path.expanduser("~/.bash_profile")):
-            shell_rc_files.append(os.path.expanduser("~/.bash_profile"))
-        if os.path.exists(os.path.expanduser("~/.profile")):
-            shell_rc_files.append(os.path.expanduser("~/.profile"))
+        # macOS 可能的shell配置文件列表
+        potential_files = [
+            "~/.zshrc",        # zsh运行命令
+            "~/.zprofile",     # zsh登录配置 
+            "~/.zshenv",       # zsh环境变量
+            "~/.bash_profile", # bash登录配置
+            "~/.bashrc",       # bash运行命令
+            "~/.profile",      # 通用shell配置
+            "~/.bash_login",   # bash登录脚本
+        ]
         
-        for rc_file in shell_rc_files:
-            self._remove_any_depot_tools_from_file(rc_file, f"~/{os.path.basename(rc_file)}")
+        shell_rc_files = []
+        for file_path in potential_files:
+            expanded_path = os.path.expanduser(file_path)
+            if os.path.exists(expanded_path):
+                shell_rc_files.append(expanded_path)
+        
+        if shell_rc_files:
+            Logger.info(f"检查 {len(shell_rc_files)} 个配置文件...")
+            for rc_file in shell_rc_files:
+                self._remove_any_depot_tools_from_file(rc_file, f"~/{os.path.basename(rc_file)}")
+        else:
+            Logger.info("未找到需要清理的shell配置文件")
     
     def _remove_from_linux_path(self):
         """从 Linux shell 配置文件中移除 depot_tools PATH"""
-        shell_rc_files = []
-        if os.path.exists(os.path.expanduser("~/.bashrc")):
-            shell_rc_files.append(os.path.expanduser("~/.bashrc"))
-        if os.path.exists(os.path.expanduser("~/.profile")):
-            shell_rc_files.append(os.path.expanduser("~/.profile"))
-        if os.path.exists(os.path.expanduser("~/.zshrc")):
-            shell_rc_files.append(os.path.expanduser("~/.zshrc"))
+        # Linux 可能的shell配置文件列表
+        potential_files = [
+            "~/.bashrc",       # bash运行命令
+            "~/.bash_profile", # bash登录配置
+            "~/.profile",      # 通用shell配置
+            "~/.bash_login",   # bash登录脚本
+            "~/.zshrc",        # zsh运行命令（如果使用zsh）
+            "~/.zprofile",     # zsh登录配置
+            "~/.zshenv",       # zsh环境变量
+        ]
         
-        for rc_file in shell_rc_files:
-            self._remove_any_depot_tools_from_file(rc_file, f"~/{os.path.basename(rc_file)}")
+        shell_rc_files = []
+        for file_path in potential_files:
+            expanded_path = os.path.expanduser(file_path)
+            if os.path.exists(expanded_path):
+                shell_rc_files.append(expanded_path)
+        
+        if shell_rc_files:
+            Logger.info(f"检查 {len(shell_rc_files)} 个配置文件...")
+            for rc_file in shell_rc_files:
+                self._remove_any_depot_tools_from_file(rc_file, f"~/{os.path.basename(rc_file)}")
+        else:
+            Logger.info("未找到需要清理的shell配置文件")
     
     def _remove_from_windows_path(self):
         """从 Windows 环境变量中移除 depot_tools PATH"""
@@ -282,18 +408,70 @@ class DepotToolsManager:
             if not os.path.exists(file_path):
                 Logger.info(f"{display_name} 不存在，跳过")
                 return
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+            
             original_len = len(lines)
-            lines = [ln for ln in lines if 'depot_tools' not in ln]
-            if len(lines) != original_len:
+            removed_lines = []
+            
+            # 过滤掉包含depot_tools的行，并记录被移除的行
+            filtered_lines = []
+            for line in lines:
+                if 'depot_tools' in line.lower():
+                    removed_lines.append(line.strip())
+                else:
+                    filtered_lines.append(line)
+            
+            # 额外清理：去除重复的PATH导出行
+            cleaned_lines = self._deduplicate_path_exports(filtered_lines)
+            
+            if len(cleaned_lines) != original_len:
+                # 创建备份
+                backup_path = f"{file_path}.backup_{int(time.time())}"
+                shutil.copy2(file_path, backup_path)
+                Logger.info(f"已创建备份: {backup_path}")
+                
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                Logger.success(f"已从 {display_name} 中移除包含 depot_tools 的 PATH 配置")
+                    f.writelines(cleaned_lines)
+                
+                removed_count = original_len - len(cleaned_lines)
+                Logger.success(f"已从 {display_name} 中移除 {removed_count} 行配置")
+                
+                if removed_lines:
+                    Logger.info("移除的行:")
+                    for line in removed_lines[:3]:  # 只显示前3行
+                        Logger.info(f"  - {line}")
+                    if len(removed_lines) > 3:
+                        Logger.info(f"  ... 还有 {len(removed_lines) - 3} 行")
             else:
-                Logger.info(f"{display_name} 中未找到 depot_tools PATH 配置")
+                Logger.info(f"{display_name} 中未找到需要清理的配置")
+                
         except Exception as e:
             Logger.warning(f"无法修改 {display_name}: {e}")
+    
+    def _deduplicate_path_exports(self, lines):
+        """去除重复的PATH导出行，保留最后一个"""
+        seen_exports = {}
+        result = []
+        
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('export PATH=') or stripped.startswith('PATH='):
+                # 提取PATH的基本模式
+                if '=' in stripped:
+                    var_part = stripped.split('=', 1)[0]
+                    seen_exports[var_part] = line  # 保存最新的
+                else:
+                    result.append(line)
+            else:
+                result.append(line)
+        
+        # 将去重后的PATH导出行添加到结果中
+        for export_line in seen_exports.values():
+            result.append(export_line)
+        
+        return result
     
     def update_depot_tools(self):
         """更新 depot_tools 到最新版本"""
