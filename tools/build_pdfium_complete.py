@@ -879,21 +879,16 @@ class PDFiumBuilder:
 
 # 基本构建配置
 is_debug = {is_debug}
-symbol_level = 2
-is_official_build = false
 
-# 优化配置
-strip_debug_info = false
-use_debug_fission = false
-enable_full_stack_frames_for_profiling = true
-use_thin_lto = false
-optimize_for_size = false
+# PDFium 独立编译配置
+pdf_is_standalone = true    # 确保 PDFium 作为独立模块编译
+is_component_build = false # Disable component build (Though it should work)
 
-# 静态库配置 - 核心要求
-is_component_build = false
-pdf_is_standalone = true
-pdf_is_complete_lib = true
-use_static_libs = true
+# 静态链接依赖库
+use_system_freetype = false # 强制使用内置的 freetype（避免外部依赖）
+use_system_libjpeg = false  # 同上，使用内置 libjpeg
+use_system_libpng = false
+use_system_zlib = false
 
 # 使用系统 libc++ 避免符号冲突
 use_custom_libcxx = false
@@ -902,30 +897,14 @@ use_custom_libcxx = false
 pdf_use_skia = false
 pdf_enable_xfa = {enable_xfa}
 pdf_enable_v8 = {enable_v8}
-pdf_use_partition_alloc = false
+
 
 # 平台配置
 target_os = "{self.config.target_os}"
 target_cpu = "{self.config.target_cpu}"
 
-# 强制静态库打包 - 关键配置
-pdf_bundle_freetype = true
-pdf_bundle_libpng = true
-pdf_bundle_zlib = true
-pdf_bundle_libopenjpeg2 = true
-
-# 编译器配置
-treat_warnings_as_errors = false
-
 # 强制使用 C++20 标准
-use_cxx17 = false
 use_cxx23 = false
-# PDFium 默认使用 C++20，这里明确确保
-
-# 忽略特定警告
-extra_cflags = [
-  "-Wno-ignored-attributes",
-]
 """
         
         config_file = build_dir / "args.gn"
@@ -954,7 +933,7 @@ extra_cflags = [
         # 同步依赖
         Logger.info("同步 PDFium 依赖...")
         self.run_command(
-            ["gclient", "sync", "-v", "--nohooks"],
+            ["gclient", "sync"],
             cwd=self.third_party_dir
         )
         
