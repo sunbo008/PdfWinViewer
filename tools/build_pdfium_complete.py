@@ -278,9 +278,48 @@ class DepotToolsManager:
         # 5. 检查当前shell PATH状态并提供解决方案
         Logger.info("检查当前shell PATH状态...")
         
-        # 重新检查当前进程的PATH（因为_clean_current_process_path可能没有实际影响shell）
-        current_path = os.environ.get("PATH", "")
-        current_depot_entries = [entry for entry in current_path.split(os.pathsep) if 'depot_tools' in entry.lower()]
+        # 检查当前shell的实际PATH状态
+        # 注意：subprocess创建的新bash进程可能有不同的PATH
+        # 我们需要检查实际的shell环境，而不是Python进程环境
+        
+        # 方法1：尝试通过环境变量获取原始PATH（在Python进程清理之前）
+        # 但这个方法有问题，因为我们已经修改了Python进程的PATH
+        
+        # 方法2：通过shell命令检查（但可能是新的shell环境）
+        try:
+            # 使用当前shell类型
+            shell_cmd = os.environ.get('SHELL', '/bin/bash')
+            result = subprocess.run(
+                [shell_cmd, '-c', 'echo $PATH'],
+                capture_output=True, text=True, check=True
+            )
+            shell_path = result.stdout.strip()
+            shell_depot_entries = [entry for entry in shell_path.split(os.pathsep) if 'depot_tools' in entry.lower()]
+            
+            Logger.info(f"通过{shell_cmd}检查的PATH中depot_tools条目: {len(shell_depot_entries)}")
+            
+        except Exception as e:
+            Logger.warning(f"无法通过shell检查PATH: {e}")
+            shell_depot_entries = []
+        
+        # 方法3：检查Python进程PATH（已被清理）
+        python_path = os.environ.get("PATH", "")
+        python_depot_entries = [entry for entry in python_path.split(os.pathsep) if 'depot_tools' in entry.lower()]
+        Logger.info(f"Python进程PATH中depot_tools条目: {len(python_depot_entries)}")
+        
+        # 重要说明：由于shell进程和Python进程的PATH环境不同
+        # 我们需要明确告知用户实际情况
+        Logger.warning("⚠️  重要说明：")
+        Logger.warning("   • Python进程的PATH已清理")
+        Logger.warning("   • 但当前shell的PATH可能仍包含depot_tools")
+        Logger.warning("   • 这是因为shell进程和Python进程是不同的进程")
+        
+        # 建议用户手动验证
+        Logger.info("💡 请手动验证当前shell PATH:")
+        Logger.info("   运行: echo $PATH | tr ':' '\\n' | grep depot_tools")
+        
+        # 由于无法准确获取当前shell的PATH，我们假设仍有depot_tools条目
+        current_depot_entries = ["假设仍有条目"]  # 强制显示解决方案
         
         if current_depot_entries:
             Logger.warning("⚠️  当前shell进程的PATH仍包含depot_tools条目")
