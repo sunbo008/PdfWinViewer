@@ -882,6 +882,7 @@ is_debug = {is_debug}
 
 # PDFium 独立编译配置
 pdf_is_standalone = true    # 确保 PDFium 作为独立模块编译
+pdf_is_complete_lib = true  # 生成单一的完整静态库 libpdfium.a
 is_component_build = false # Disable component build (Though it should work)
 
 # 静态链接依赖库
