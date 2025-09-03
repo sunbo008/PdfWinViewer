@@ -19,10 +19,12 @@ PDFium 完整构建脚本 (Python版本)
   ✅ 支持彻底清理 depot_tools (包括 PATH 配置)
   ✅ 安装到 tools 目录，避免权限问题
   ✅ 自动配置 PATH 环境变量 (支持 macOS/Linux/Windows)
+  ✅ 使用 PDFium 自带的 gn 工具，无需系统级依赖
   ✅ 交互式构建配置选择
   ✅ 支持 Debug/Release 构建
   ✅ 可配置 V8 JavaScript 和 XFA 表单支持
   ✅ 使用系统 libc++ 避免符号冲突
+  ✅ 自动生成完整的 libpdfium.a 静态库
 """
 
 import os
@@ -825,7 +827,7 @@ class PDFiumBuilder:
         """检查构建依赖"""
         Logger.info("检查构建依赖...")
         
-        # 检查并设置 depot_tools
+        # 检查并设置 depot_tools（用于gclient同步）
         if not self.depot_manager.setup_depot_tools():
             Logger.error("depot_tools 设置失败，无法继续构建")
             sys.exit(1)
@@ -836,6 +838,35 @@ class PDFiumBuilder:
             Logger.success("CMake 已安装")
         except (subprocess.CalledProcessError, FileNotFoundError):
             Logger.error("CMake 未安装，请先安装 CMake")
+            sys.exit(1)
+    
+    def get_pdfium_gn_path(self) -> Path:
+        """获取PDFium自带的gn工具路径"""
+        # 根据平台确定gn可执行文件名
+        gn_name = "gn.exe" if self.config.target_os == "win" else "gn"
+        gn_path = self.pdfium_dir / "buildtools" / self.config.target_os / gn_name
+        
+        if not gn_path.exists():
+            Logger.error(f"PDFium gn工具不存在: {gn_path}")
+            Logger.error("请确保PDFium源码完整下载并同步")
+            sys.exit(1)
+        
+        if not gn_path.is_file():
+            Logger.error(f"PDFium gn工具不是可执行文件: {gn_path}")
+            sys.exit(1)
+            
+        # 检查gn工具是否可执行
+        try:
+            result = subprocess.run([str(gn_path), "--version"], 
+                                 capture_output=True, check=True, text=True)
+            Logger.success(f"PDFium gn工具可用 (版本: {result.stdout.strip()})")
+            return gn_path
+        except subprocess.CalledProcessError as e:
+            Logger.error(f"PDFium gn工具无法执行: {e}")
+            Logger.error("可能需要重新同步PDFium依赖")
+            sys.exit(1)
+        except FileNotFoundError:
+            Logger.error(f"PDFium gn工具无法找到: {gn_path}")
             sys.exit(1)
     
     def clean_build_artifacts(self):
@@ -938,6 +969,10 @@ use_cxx23 = false
             cwd=self.third_party_dir
         )
         
+        # 验证PDFium gn工具可用性
+        Logger.info("验证PDFium构建工具...")
+        self.get_pdfium_gn_path()  # 这会检查gn工具并显示版本信息
+        
         # 创建构建配置
         Logger.info("配置 PDFium 构建参数...")
         build_dir = self.pdfium_dir / "out" / self.config.build_type
@@ -947,7 +982,7 @@ use_cxx23 = false
         
         # 生成构建文件
         Logger.info("生成构建文件...")
-        gn_path = self.pdfium_dir / "buildtools" / self.config.target_os / "gn"
+        gn_path = self.get_pdfium_gn_path()
         self.run_command([str(gn_path), "gen", str(build_dir)], cwd=self.pdfium_dir)
         
         # 构建 PDFium
